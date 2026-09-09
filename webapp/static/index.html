@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>铜产品减量化模型智能体</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <!-- ================= 左侧：任务配置面板 ================= -->
+  <aside class="panel-left">
+    <div class="header">
+      <div class="header-icon" id="product-icon">☀️</div>
+      <div class="header-text">
+        <h1 id="run-title">铜产品减量化模型智能体</h1>
+        <p class="subtitle">7类产品多维型号、含铜部位与证据调研；输出标准 JSON 与正式报告。</p>
+      </div>
+      <span id="mode-badge" class="mode-badge">…</span>
+    </div>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="single">运行一次</button>
+      <button class="tab" data-tab="batch">批量运行</button>
+    </nav>
+
+    <section class="form">
+      <label class="field-label">目标产品 <span class="hint" id="select-hint">（单选）</span></label>
+      <div class="product-grid" id="product-grid"></div>
+
+      <label class="field-label" for="region">研究区域</label>
+      <input id="region" type="text" value="中国">
+
+      <label class="field-label" for="baseline-year">调研基准年</label>
+      <input id="baseline-year" type="number" value="2025" min="2000" max="2035">
+
+      <label class="field-label" for="constraints">补充约束 <span class="hint">（选填）</span></label>
+      <textarea id="constraints" rows="4" placeholder="如：聚焦中国市场、需引用国标/行标、区分子类别分别给出数据…"></textarea>
+
+      <div class="actions">
+        <button id="btn-clear" class="btn ghost">清空</button>
+        <div class="actions-right">
+          <button id="btn-stop" class="btn ghost danger" hidden>■ 停止运行</button>
+          <button id="btn-run" class="btn primary">开始运行</button>
+        </div>
+      </div>
+
+      <div id="run-history" class="run-history">
+        <div class="field-label">运行历史</div>
+        <div id="history-list" class="history-list"><div class="empty">暂无运行记录</div></div>
+      </div>
+    </section>
+  </aside>
+
+  <!-- ================= 右侧：工作流 + 结果面板 ================= -->
+  <main class="panel-right">
+    <!-- 人工审核卡片（waiting_review 时显示） -->
+    <div id="review-card" class="card review-card" hidden>
+      <div class="card-title">🕓 人工审核关卡</div>
+      <p class="review-note">图A调研已完成并暂停，请审核以下成果预览（对应 schema 的 ProductResearchOutput）：</p>
+      <div id="review-summary" class="review-summary"></div>
+      <div id="review-body" class="review-body"></div>
+      <div class="review-actions">
+        <button id="btn-approve" class="btn primary">✓ 通过并定稿</button>
+        <select id="reject-target" class="select-inline">
+          <option value="dimension_agent">打回：维度分析师</option>
+          <option value="structure_agent">打回：结构分析师</option>
+          <option value="copper_agent">打回：铜部件识别</option>
+        </select>
+        <input id="reject-note" class="input-inline" placeholder="打回意见（选填）">
+        <button id="btn-reject" class="btn ghost danger">✗ 打回重做</button>
+      </div>
+    </div>
+
+    <!-- 工作流卡片 -->
+    <div class="card workflow-card">
+      <div class="card-title" id="workflow-title">✳ 工作流</div>
+      <div id="workflow-steps" class="workflow-steps"></div>
+      <div id="run-status-line" class="run-status-line" hidden></div>
+    </div>
+
+    <!-- 执行事件流 -->
+    <div class="card events-card" id="events-card" hidden>
+      <div class="card-title">执行日志</div>
+      <div id="events-list" class="events-list"></div>
+    </div>
+
+    <!-- 结果面板 -->
+    <div class="card result-card" id="result-card" hidden>
+      <div class="result-header">
+        <div class="card-title">调研成果</div>
+        <div class="result-actions">
+          <button id="btn-reduction" class="btn primary small" hidden>▶ 启动减量化分析（图B）</button>
+          <a id="btn-export-xlsx" class="btn ghost small">导出 Excel</a>
+          <a id="btn-export-json" class="btn ghost small">导出 JSON</a>
+        </div>
+      </div>
+      <nav class="tabs result-tabs" id="result-tabs"></nav>
+      <div id="result-body" class="result-body"></div>
+    </div>
+
+    <div id="placeholder" class="placeholder">
+      <div class="placeholder-icon">⚙️</div>
+      <p>选择产品并点击「开始运行」<br>工作流进度与调研成果将在此展示</p>
+    </div>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

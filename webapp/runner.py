@@ -18,6 +18,7 @@ LLM 双模式：
 from __future__ import annotations
 import json
 import os
+import queue
 import threading
 import traceback
 import uuid
@@ -115,7 +116,8 @@ def llm_mode() -> str:
 DATA_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "data" / "runs"
 # 活跃run中不可序列化（Event/Thread）也不需要持久化的键
 _VOLATILE_KEYS = ("_review_event", "_cancel", "_thread", "_review_decision",
-                  "review", "review_preview")
+                  "review", "review_preview", "stream_buf", "stream_current",
+                  "_subscribers")
 
 
 class RunManager:
@@ -181,6 +183,8 @@ class RunManager:
             "review_preview": None,  # 人工审核完整预览（ProductResearchOutput dump）
             "error": None,
             "result": None,
+            "stream_buf": {},      # 节点级LLM流式输出缓冲（stream_mode="messages"）
+            "stream_current": None,  # 当前正在产出token的节点
             "llm_mode": llm_mode(),
             "parent_run_id": None,
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -305,13 +309,24 @@ class RunManager:
             payload = init_state
 
             while True:
-                for chunk in graph.stream(payload, config, stream_mode="updates"):
+                # 双流模式：updates 负责节点级进度，messages 负责LLM token级增量
+                for mode, chunk in graph.stream(payload, config,
+                                                 stream_mode=["updates", "messages"]):
                     if run["_cancel"].is_set():
                         run["status"] = "cancelled"
                         run["finished_at"] = datetime.now().isoformat(timespec="seconds")
                         self._add_event(run, "done", "已停止", "用户手动停止了本次运行")
                         self._persist(run)
                         return
+                    if mode == "messages":
+                        # LLM token增量：按节点缓存，供前端点击节点查看实时思考过程
+                        msg, meta = chunk
+                        node = str((meta or {}).get("langgraph_node") or "?")
+                        text = self._llm_chunk_text(msg)
+                        if text:
+                            self._append_stream(run, node, text)
+                        continue
+                    # ---- mode == "updates" ----
                     if "__interrupt__" in chunk:
                         intr = chunk["__interrupt__"][0]
                         run["review"] = self._summarize_review(intr.value)
@@ -361,6 +376,55 @@ class RunManager:
     # --------------------------------------------------------
     # 节点进度记录
     # --------------------------------------------------------
+    # --------------------------------------------------------
+    # LLM 流式输出采集（stream_mode="messages"）
+    # --------------------------------------------------------
+    @staticmethod
+    def _llm_chunk_text(msg) -> str:
+        """从AIMessageChunk提取可展示文本增量。
+        结构化输出(function calling)的实际生成内容在 tool_call_chunks 的
+        args 里逐字符流出，与普通content一并展示。"""
+        c = getattr(msg, "content", "")
+        if isinstance(c, str):
+            text = c
+        elif isinstance(c, list):
+            text = "".join(x.get("text", "") for x in c if isinstance(x, dict))
+        else:
+            text = ""
+        tc = getattr(msg, "tool_call_chunks", None)
+        if tc:
+            text += "".join((a.get("args") or "") for a in tc)
+        return text
+
+    def _append_stream(self, run: dict, node: str, text: str):
+        """全量累积token增量（不人为截断，数据完整性优先）；
+        可视区域的滚动丢弃由前端overflow滚动自然完成。
+        同时把增量推给所有SSE订阅者（逐字打字机观感）。"""
+        buf = run.setdefault("stream_buf", {})
+        buf[node] = (buf.get(node) or "") + text
+        run["stream_current"] = node
+        for q in list(run.get("_subscribers") or []):
+            try:
+                q.put_nowait((node, text))  # 慢消费者队列满时丢弃，不阻塞图执行
+            except queue.Full:
+                pass
+
+    def subscribe(self, run_id: str):
+        """注册SSE订阅者，返回接收(node,text)增量的队列；run不存在返回None"""
+        run = self._runs.get(run_id)
+        if run is None:
+            return None
+        q = queue.Queue(maxsize=2000)
+        run.setdefault("_subscribers", []).append(q)
+        return q
+
+    def unsubscribe(self, run_id: str, q) -> None:
+        run = self._runs.get(run_id)
+        if run is not None:
+            subs = run.get("_subscribers") or []
+            if q in subs:
+                subs.remove(q)
+
     def _record_node(self, run: dict, node: str, update: dict):
         counts = run["node_counts"]
         counts[node] = counts.get(node, 0) + 1
@@ -410,6 +474,9 @@ class RunManager:
         d["total_round"] = run.get("total_round")
         d["events"] = run["events"][-120:]
         d["review"] = run.get("review")
+        # LLM流式输出（按节点缓存的token累积文本），供前端实时展示思考过程
+        d["stream_buf"] = run.get("stream_buf") or {}
+        d["stream_current"] = run.get("stream_current")
         # 待审核时附完整预览内容（审核卡片内直接展示，而不是只给统计数字）
         if run["status"] == "waiting_review":
             d["review_preview"] = run.get("review_preview")

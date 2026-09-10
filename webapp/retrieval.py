@@ -60,6 +60,16 @@ SKIP_SEARCH_MARKERS = ("主管", "审查专家", "调研团队主管", "减量�
 MAX_RESULTS_PER_QUERY = 4
 CONTENT_SNIPPET_CHARS = 600
 SEARCH_TIMEOUT = 25
+# 校验失败后的自愈重试次数（把Pydantic错误回喂给LLM修正）
+MAX_SELF_HEAL_RETRIES = 2
+
+SELF_HEAL_PROMPT = (
+    "你上一次的输出未能通过Pydantic数据校验，错误信息：\n{err}\n\n"
+    "请严格按原Schema重新输出完整JSON，务必纠正上述错误："
+    "必填字段缺失的必须补上；类型不符（如字符串字段填了null）的必须替换为"
+    "符合类型的合法值。所有ID类字段（如parent_subsystem_id）必须引用"
+    "输入上下文中真实存在的标识符，禁止填null、空串或无意义占位符；"
+    "其它已正确的字段保持不变。不要输出任何解释文字。")
 
 
 def tavily_search(api_key: str, query: str, max_results: int = MAX_RESULTS_PER_QUERY) -> list[dict]:
@@ -268,6 +278,20 @@ class RetrievalAugmentedLLM:
         print(f"[retrieval] {self.product_name}/{role}: 获得{len(results)}条证据", flush=True)
         return SystemMessage(content=evidence_block)
 
+    def _self_heal(self, base_msgs, first_error, redo):
+        """校验失败自愈：把Pydantic错误信息回喂给模型重试（最多2次）。
+        redo(m) 接收追加修复提示后的消息列表，返回已验证结果。"""
+        last = first_error
+        for attempt in range(1, MAX_SELF_HEAL_RETRIES + 1):
+            print(f"[self-heal] {self.product_name}: 第{attempt}次修正重试 "
+                  f"({type(last).__name__}: {str(last)[:160]})", flush=True)
+            fix = SystemMessage(content=SELF_HEAL_PROMPT.format(err=str(last)[:1500]))
+            try:
+                return redo([*base_msgs, fix])
+            except (ValidationError, ValueError) as exc:
+                last = exc
+        raise last
+
     def _search_for_role(self, role: str) -> tuple[str, list[dict]]:
         queries = [f"{self.product_name} {q}" for q in ROLE_QUERY_TEMPLATES[role]]
         all_results: list[dict] = []
@@ -303,7 +327,15 @@ class _SingleStructured:
         msgs = self.parent._compose(messages)
         if evidence is not None:
             msgs = [evidence, *msgs]
-        return coerce_structured(self.inner_so.invoke(msgs), self.schema)
+
+        def redo(m):
+            return coerce_structured(self.inner_so.invoke(m), self.schema)
+
+        try:
+            return redo(msgs)
+        except (ValidationError, ValueError) as exc:
+            # 自愈：校验失败时把错误回喂给模型，让它修正自己的输出
+            return self.parent._self_heal(msgs, exc, redo)
 
 
 class _ListStructured:
@@ -327,7 +359,17 @@ class _ListStructured:
         msgs = self.parent._compose(messages, extra_tail=tail)
         if evidence is not None:
             msgs = [evidence, *msgs]
-        resp = self.parent.inner.invoke(msgs)
+
+        def redo(m):
+            return self._parse_and_validate(self.parent.inner.invoke(m))
+
+        try:
+            return redo(msgs)
+        except (ValidationError, ValueError) as exc:
+            # 自愈：解析失败或字段校验失败时回喂错误重试
+            return self.parent._self_heal(msgs, exc, redo)
+
+    def _parse_and_validate(self, resp):
         content = resp.content if isinstance(resp.content, str) else str(resp.content)
         data = _extract_json_array(content)
         if data is None:

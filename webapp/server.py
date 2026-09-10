@@ -14,7 +14,9 @@ LangGraph 工作流。
 """
 
 from __future__ import annotations
+import json
 import os
+import queue
 import sys
 
 # 保证以 `python3 webapp/server.py` 或 uvicorn 任意cwd启动时都能找到模块：
@@ -25,8 +27,29 @@ for _p in (_ROOT, _WEBAPP):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+
+def _load_env_file():
+    """启动时自动加载 webapp/.env（已设置的环境变量优先，不被覆盖）。
+    使 mimo/Tavily 密钥持久化配置：无论谁、在何目录、如何启动服务，
+    都无需手动 export。已有真实环境变量时以环境变量为准。"""
+    env_path = os.path.join(_WEBAPP, ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip()
+            if k and v and k not in os.environ:
+                os.environ[k] = v
+
+
+_load_env_file()
+
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, Response, JSONResponse
+from fastapi.responses import FileResponse, Response, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -177,6 +200,42 @@ def export_json(run_id: str):
     return JSONResponse(content=run["result"],
                         headers={"Content-Disposition":
                                  f'attachment; filename="{run["product_id"]}-{run["run_id"]}.json"'})
+
+
+# LLM token增量的SSE推送：前端EventSource订阅，实现逐字打字机观感
+_TERMINAL_STATUS = {"completed", "failed", "cancelled", "interrupted"}
+
+
+@app.get("/api/runs/{run_id}/events")
+def stream_events(run_id: str):
+    if manager.get(run_id) is None:
+        raise HTTPException(404, "运行不存在")
+    q = manager.subscribe(run_id)
+
+    def gen():
+        try:
+            # 先推一次当前已有缓冲（前端直接填充，不回放打字机）
+            run = manager.get(run_id)
+            init = {"type": "init", "buf": (run or {}).get("stream_buf") or {}}
+            yield f"data: {json.dumps(init, ensure_ascii=False)}\n\n"
+            while True:
+                run = manager.get(run_id)
+                if run is None or (run.get("status") in _TERMINAL_STATUS and q.empty()):
+                    yield "data: {\"type\":\"end\"}\n\n"
+                    return
+                try:
+                    node, text = q.get(timeout=10)
+                    payload = json.dumps({"type": "token", "node": node, "text": text},
+                                         ensure_ascii=False)
+                    yield f"data: {payload}\n\n"
+                except queue.Empty:
+                    yield ": ping\n\n"  # 心跳保活
+        finally:
+            manager.unsubscribe(run_id, q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 # ============================================================

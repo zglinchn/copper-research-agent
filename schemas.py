@@ -126,11 +126,26 @@ _PHYSICAL_SPEC_TOKEN = re.compile(
     re.IGNORECASE,
 )
 
+# 语义特征词：不带数字规格，但暗示"是否集成/具备某附加功能"这条独立的轴——
+# 真实案例：光伏站"核心技术设备类型（逆变器拓扑）"维度下混入"光储一体机"，
+# 这个取值真正的区分特征是"是否集成储能"，跟"电路是集中式/组串式/微型"是
+# 两个不同的轴。这类串轴是纯语义层面的，_PHYSICAL_SPEC_TOKEN 的"数字+单位"
+# 模式抓不住，需要单独一组构词特征词做初筛（同样只产出警示，不直接判错）。
+_SEMANTIC_FEATURE_TOKEN = re.compile(
+    r"(一体机|一体化|集成式|集成型|复合型|混合型|多功能|组合式|智能型|智能化)"
+)
+
 
 def heuristic_axis_consistency_scan(dimension: "ClassificationDimension") -> list[str]:
     """对某个已产出的维度做代码层面的初筛，标记"取值名称看起来像另一个轴"的可疑项。
     仅产出警示文本供CriticAgent参考，不直接判定为错误（避免正则误伤），
     但如果CriticAgent对被标记的取值视而不见，人工复核时能一眼看出漏检。
+
+    两类独立的初筛模式：
+    - 物理规格模式（_PHYSICAL_SPEC_TOKEN）：抓"数字+单位"的物理规格/参数特征。
+    - 语义特征模式（_SEMANTIC_FEATURE_TOKEN）：抓"一体机/集成式"等暗示"是否
+      具备附加功能"的构词特征，这类串轴无法靠正则确诊，只能提示critic去做
+      "能否用axis_of_variation原句造出通顺判断句"的语义自测（见critic persona）。
     """
     warnings: list[str] = []
     for v in dimension.values:
@@ -141,10 +156,21 @@ def heuristic_axis_consistency_scan(dimension: "ClassificationDimension") -> lis
         )
         if looks_like_spec and category_claims_non_spec:
             warnings.append(
-                f"[系统预警-启发式] 维度「{dimension.dimension_name}」"
+                f"[系统预警-启发式:物理规格] 维度「{dimension.dimension_name}」"
                 f"(声称类别: {dimension.dimension_category.value}) 的取值「{v.value_name}」"
                 f"包含物理规格/参数特征的字符模式，与该维度声称的分类角度不符，"
                 f"请重点核查该取值是否为跨轴混入。"
+            )
+
+        looks_like_semantic_feature = bool(_SEMANTIC_FEATURE_TOKEN.search(v.value_name))
+        if looks_like_semantic_feature:
+            warnings.append(
+                f"[系统预警-启发式:语义特征] 维度「{dimension.dimension_name}」"
+                f"(axis_of_variation: {dimension.axis_of_variation}) 的取值「{v.value_name}」"
+                f"包含'一体机/集成式/复合型'等暗示'是否具备附加功能'的构词特征，"
+                f"这类特征通常自成一条独立的分类轴（如'是否集成储能'），而不一定是"
+                f"该维度声称的轴。请对这条取值做自测：能否只用该维度的axis_of_variation"
+                f"原句，为它造出一句通顺的判断句？造不出来就是跨轴混入。"
             )
     return warnings
 

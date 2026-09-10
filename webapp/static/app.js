@@ -646,6 +646,16 @@ function renderDims(dims) {
     </div>`).join("");
 }
 
+// CopperAgent对"确认不含铜"的叶子节点，会显式返回一条copper_form==="other"
+// 且function_of_copper以"不适用"开头的CopperComponent记录（这是有意为之的
+// 设计：不遗漏不提，参见COPPER_AGENT_PERSONA）。这不代表该部件真的含铜，
+// 树状视图之前对copper_components数组不加区分地全部打Cu·标签，会让"玻璃/
+// EVA/背板"这类被正确判定为不含铜的部件在视觉上显得像是被误判为含铜——
+// 这是一次真实实测暴露的展示bug，不是CopperAgent的判断问题。
+function isNoCopperPlaceholder(c) {
+  return c.copper_form === "other" && String(c.function_of_copper || "").startsWith("不适用");
+}
+
 function renderTree(result) {
   const subs = result.functional_subsystems || [];
   const compsByParent = {};
@@ -655,7 +665,8 @@ function renderTree(result) {
   const lvl0 = subs.filter(s => !s.parent_subsystem_id);
   const children = (pid) => subs.filter(s => s.parent_subsystem_id === pid);
   const renderNode = (s, depth) => {
-    const cus = compsByParent[s.subsystem_id] || [];
+    const allCus = compsByParent[s.subsystem_id] || [];
+    const cus = allCus.filter(c => !isNoCopperPlaceholder(c));
     const kids = children(s.subsystem_id).map(c => renderNode(c, depth + 1)).join("");
     return `
       <div class="tree-node" style="padding-left:${depth * 26}px">

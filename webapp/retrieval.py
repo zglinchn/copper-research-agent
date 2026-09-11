@@ -21,36 +21,65 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from datetime import datetime
+from pathlib import Path
 from typing import get_args, get_origin
 
 import requests
 from langchain_core.messages import SystemMessage
 from pydantic import BaseModel, ValidationError
 
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from regions import RegionInfo
+from evidence_scoring import classify_source_tier, citation_region_hit
+
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
 
-# 角色标记(取自各persona的「」称号) -> 检索查询模板（不含产品名，运行时拼接）
-ROLE_QUERY_TEMPLATES: dict[str, list[str]] = {
+# 角色标记(取自各persona的「」称号) -> 基础查询模板（不含产品名/区域，运行时拼接）
+# 双语模板：(中文, 英文)，按区域的 query_lang 选择，避免非中文区域检索被中文源占据
+ROLE_QUERY_TEMPLATES: dict[str, list[tuple[str, str]]] = {
     "分类维度分析师": [
-        "主流型号 分类维度 技术路线",
-        "型号分类 规格 标准 类型",
+        ("主流型号 分类维度 技术路线", "main product models classification technology routes"),
+        ("型号分类 规格 标准 类型", "product models specifications standards types"),
     ],
     "产品结构分析师": [
-        "系统组成 主要部件 结构",
-        "整机构成 部件 BOM",
+        ("系统组成 主要部件 结构", "system components main parts structure"),
+        ("整机构成 部件 BOM", "product BOM assembly parts list"),
     ],
     "铜部件识别专家": [
-        "含铜部件 铜用量 kg",
-        "铜质量 拆解 用铜量",
+        ("含铜部件 铜用量 kg", "copper content parts kg per unit"),
+        ("铜质量 拆解 用铜量", "teardown copper mass windings"),
     ],
     "铜减量化技术顾问": [
-        "铜减量化 材料替代 措施",
-        "减少铜用量 工程案例",
+        ("铜减量化 材料替代 措施", "copper reduction material substitution"),
+        ("减少铜用量 工程案例", "copper saving engineering case"),
     ],
     "定量分析师": [
-        "单位铜强度 情景",
-        "铜强度 预测 2035",
+        ("单位铜强度 情景", "copper intensity per unit forecast"),
+        ("铜强度 预测 2035", "copper intensity projection 2035"),
+    ],
+}
+
+# 区域专项查询（每角色1条；拼接在基础查询之后，占用剩余证据额度）
+REGION_ROLE_QUERY_TEMPLATES: dict[str, list[tuple[str, str]]] = {
+    "分类维度分析师": [
+        ("市场占有率 主流型号", "market share leading models"),
+    ],
+    "产品结构分析师": [
+        ("市场主流配置 型号", "market mainstream configuration"),
+    ],
+    "铜部件识别专家": [
+        ("铝代铜 铝绕组 铜绕组 市场份额", "aluminum winding copper winding market share"),
+    ],
+    "铜减量化技术顾问": [
+        ("铝代铜 政策 电网 变压器", "aluminum substitution policy transformer grid"),
+    ],
+    "定量分析师": [
+        ("市场规模 铜 用量", "market size copper consumption"),
     ],
 }
 
@@ -58,6 +87,7 @@ ROLE_QUERY_TEMPLATES: dict[str, list[str]] = {
 SKIP_SEARCH_MARKERS = ("主管", "审查专家", "调研团队主管", "减量化团队主管")
 
 MAX_RESULTS_PER_QUERY = 4
+MAX_EVIDENCE_AFTER_DEDUPE = 10  # URL去重后的证据上限（区域查询占用额度）
 CONTENT_SNIPPET_CHARS = 600
 SEARCH_TIMEOUT = 25
 # 校验失败后的自愈重试次数（把Pydantic错误回喂给LLM修正）
@@ -217,12 +247,16 @@ def format_evidence_block(results: list[dict], queries: list[str]) -> str:
         "你的产出必须优先基于这些证据；Citation 请引用其中真实存在的来源"
         "（title/publisher/url 照抄，不要改动），来源类型按实际情况选择。"
         "若你用自身知识补充证据之外的结论，url 必须留空，【严禁编造任何URL或文献】；"
-        "证据不足以支撑的字段宁可留空/标注不确定性，也不允许臆断。",
+        "证据不足以支撑的字段宁可留空/标注不确定性，也不允许臆断。"
+        "标注了[区域命中]的结果明确覆盖研究区域，引用时应填"
+        "Citation.evidence_country 为该结果实际覆盖的国家；"
+        "未命中的结果一般是全球/其他区域口径。",
         "",
     ]
     for i, r in enumerate(results, start=1):
         date = f"，日期 {r['published_date']}" if r["published_date"] else ""
-        lines.append(f"[{i}] {r['title']}（{r['url']}{date}）")
+        hit = "[区域命中] " if r.get("region_hit") else ""
+        lines.append(f"[{i}] {hit}{r['title']}（{r['url']}{date}）")
         if r["content"]:
             lines.append(f"    摘要：{r['content']}")
         lines.append("")
@@ -240,11 +274,13 @@ class RetrievalAugmentedLLM:
     """
 
     def __init__(self, inner, product_name: str, context_text: str = "",
-                 api_key: str | None = None):
+                 api_key: str | None = None, region=None):
         self.inner = inner
         self.product_name = product_name
         self.context_text = context_text
         self.api_key = api_key or os.environ.get("TAVILY_API_KEY")
+        # 区域：RegionInfo 或 None（自由文本区域）；区域检索词/命中词由此驱动
+        self.region = region if isinstance(region, RegionInfo) else None
         # 可观测性：记录本LLM实例的全部检索行为，供上层写入执行日志
         self.search_log: list[dict] = []
 
@@ -293,7 +329,32 @@ class RetrievalAugmentedLLM:
         raise last
 
     def _search_for_role(self, role: str) -> tuple[str, list[dict]]:
-        queries = [f"{self.product_name} {q}" for q in ROLE_QUERY_TEMPLATES[role]]
+        # 按区域查询语言选择基础模板（双语对），并追加区域专项查询
+        lang = self.region.query_lang if self.region else "both"
+
+        def pick(pair):
+            zh, en = pair
+            if lang == "zh":
+                return [zh]
+            if lang == "en":
+                return [en]
+            return [zh, en]
+
+        terms: list[str] = []
+        for pair in ROLE_QUERY_TEMPLATES[role]:
+            terms.extend(pick(pair))
+        region_terms: list[str] = []
+        for pair in REGION_ROLE_QUERY_TEMPLATES.get(role, []):
+            region_terms.extend(pick(pair))
+
+        region_alias = (self.region.all_hit_terms[0] if self.region
+                        else None)
+        queries = [f"{self.product_name} {q}" for q in terms]
+        if self.region and region_alias:
+            queries += [f"{region_alias} {self.product_name} {q}" for q in region_terms]
+        elif region_terms:
+            queries += [f"{self.product_name} {q}" for q in region_terms]
+
         all_results: list[dict] = []
         errors = []
         for q in queries:
@@ -305,13 +366,17 @@ class RetrievalAugmentedLLM:
                 self.search_log.append({"query": q, "ok": False, "error": str(exc)[:120]})
         if errors:
             print(f"[retrieval] 检索部分失败({self.product_name}/{role}): {errors}", flush=True)
-        # 按URL去重，避免两条查询结果重叠
+        # 按URL去重，避免多条查询结果重叠；逐条标注区域命中与来源分层
         seen, uniq = set(), []
         for r in all_results:
-            if r["url"] and r["url"] not in seen:
-                seen.add(r["url"])
-                uniq.append(r)
-        return format_evidence_block(uniq[:8], queries), uniq
+            if not r["url"] or r["url"] in seen:
+                continue
+            seen.add(r["url"])
+            r["region_hit"] = citation_region_hit(r, self.region)
+            r["source_tier"] = classify_source_tier(r.get("title", ""), r["url"])
+            uniq.append(r)
+        uniq.sort(key=lambda x: 0 if x.get("region_hit") else 1)  # 区域命中优先展示
+        return format_evidence_block(uniq[:MAX_EVIDENCE_AFTER_DEDUPE], queries), uniq[:MAX_EVIDENCE_AFTER_DEDUPE]
 
 
 class _SingleStructured:

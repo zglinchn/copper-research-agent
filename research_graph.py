@@ -68,14 +68,26 @@ RESEARCH_STAGE_AGENTS: dict[str, set[AgentRole]] = {
 class ResearchState(TypedDict):
     product_id: str
     product_name: str
+    region_id: str
+    region_name: str
 
-    stage: Literal["dimension_structure_debate", "copper_identification", "human_review", "done"]
+    stage: Literal["dimension_structure_debate", "copper_identification",
+                   "human_review", "done"]
 
     dimension_proposal: list[dict]
     dimension_version: int
     structure_proposal: list[dict]
     structure_version: int
     copper_components: list[dict]
+
+    # 区域证据充分度评估与口径（region_evidence_gate 产出）
+    evidence_assessment: Optional[dict]
+    evidence_policy: str
+    evidence_gate_done: bool
+    # critic 对证据覆盖度的评分（s5 分项，None 则 gate 用程序化兜底）
+    critic_coverage_score: Optional[int]
+    # 校验标记（含 gate 产出的 region_basis_unsupported 审计项）
+    validation_flags: list[dict]
 
     # upsert_objections: 按objection_id去重覆盖，state里任何时刻都是干净的
     # "每条id只有一份最新记录"的列表，所有节点直接读state["objections"]即可，
@@ -318,6 +330,15 @@ def critic_agent(state: ResearchState, llm) -> Command:
     for dim_dict in state["dimension_proposal"]:
         dim = ClassificationDimension.model_validate(dim_dict)
         heuristic_warnings.extend(heuristic_axis_consistency_scan(dim))
+    # 确定性检查：含铜部位缺 unit_mass 数值 → 基线强度无法计算（硬伤）
+    massless = [c.get("component_id") for c in state.get("copper_components") or []
+                if not ((c.get("unit_mass") or {}).get("value"))]
+    if massless:
+        heuristic_warnings.append(
+            f"[系统预警-确定性检测] 以下含铜部位缺失 unit_mass 数值，基线强度将无法计算，"
+            f"请务必生成 unsupported_claim 类型objection（severity=blocking，"
+            f"target_agent=copper_agent）要求补充质量数据：{massless}"
+        )
     heuristic_text = "\n".join(heuristic_warnings) or "(本轮启发式扫描未发现可疑项)"
 
     messages = [
@@ -380,6 +401,9 @@ def critic_agent(state: ResearchState, llm) -> Command:
             "debate_log": [log_entry.model_dump()],
             "round_in_stage": state["round_in_stage"] + 1,
             "total_round": state["total_round"] + 1,
+            # critic 顺带给出的证据覆盖度评分（s5 分项），供 region_evidence_gate 使用
+            **({"critic_coverage_score": review.evidence_coverage_score}
+               if review.evidence_coverage_score is not None else {}),
         },
     )
 
@@ -392,6 +416,17 @@ COPPER_AGENT_PERSONA = """\
 你是「铜部件识别专家」。基于StructureAgent已定稿的子系统分解，逐一判断
 每个叶子子系统是否含铜、铜的形态与含铜原因。若确认不含铜也要显式返回，
 不要遗漏不提。
+
+【硬性要求：单位铜质量不可缺失】每个含铜部位【必须】给出 unit_mass
+（单台/单件产品中该部件的铜质量，单位用 kg 或 t）。取值优先级：
+1. 检索证据中的实测/拆解/BOM数据（mass_data_basis=teardown_measurement
+   /bom_disclosure/literature_reported，附Citation）；
+2. 无直接数据时按同类似产品工程估算
+   （mass_data_basis=engineering_estimate，并在 function_of_copper 或
+   字段描述中说明估算依据）。
+缺失 unit_mass 将导致后续基线强度无法计算——这是硬性产出要求，
+不是可选项。applies_to_dimension_values 仅在该部件确实只适用于
+某特定取值组合时填写，通用部件留空。
 
 {objection_context}
 
@@ -480,9 +515,15 @@ def supervisor(state: ResearchState, llm) -> Command:
     blocking = [o for o in state["objections"] if o["severity"] == "blocking" and not o.get("addressed")]
     blocking_sorted = sorted(blocking, key=lambda x: x["flag_type"] != "dimension_value_axis_mismatch")
 
+    def _to_review(update: dict | None = None) -> Command:
+        # 人工审核前先过区域证据关卡；打回重做后的二次审核不再重跑评估
+        if state.get("evidence_gate_done"):
+            return Command(goto="human_review_gate",
+                           update={"stage": "human_review", **(update or {})})
+        return Command(goto="region_evidence_gate", update=update or {})
+
     if state["total_round"] >= MAX_TOTAL_ROUNDS:
-        return Command(goto="human_review_gate", update={
-            "stage": "human_review",
+        return _to_review({
             "debate_log": [DebateLogEntry(
                 round=state["total_round"], speaker="supervisor",
                 message_type="routing_decision",
@@ -491,7 +532,7 @@ def supervisor(state: ResearchState, llm) -> Command:
         })
 
     if state["stage"] == "done":
-        return Command(goto="human_review_gate")
+        return _to_review()
 
     messages = [
         SystemMessage(content=SUPERVISOR_PERSONA.format(
@@ -530,9 +571,7 @@ def supervisor(state: ResearchState, llm) -> Command:
         next_stage, next_round_in_stage = "copper_identification", 0
 
     if decision.should_terminate or next_round_in_stage >= MAX_ROUNDS_PER_STAGE:
-        return Command(goto="human_review_gate", update={
-            "stage": "human_review", "debate_log": [log_entry.model_dump()],
-        })
+        return _to_review({"debate_log": [log_entry.model_dump()]})
 
     return Command(
         goto=decision.next_agent,
@@ -583,6 +622,8 @@ def human_review_gate(state: ResearchState) -> Command:
     output = ProductResearchOutput(
         product_id=state["product_id"],
         product_name=state["product_name"],
+        region_id=state.get("region_id") or "unknown",
+        region_name=state.get("region_name") or "unknown",
         research_version=state["research_version"],
         research_status="pending_human_review",
         classification_dimensions=state["dimension_proposal"],
@@ -590,6 +631,8 @@ def human_review_gate(state: ResearchState) -> Command:
         copper_components=state["copper_components"],
         objections=state["objections"],
         debate_log=state["debate_log"],
+        evidence_assessment=state.get("evidence_assessment"),
+        validation_flags=state.get("validation_flags") or [],
     )
 
     # 真正的暂停点：graph执行到这里会挂起，把payload返回给调用方，
@@ -658,6 +701,96 @@ def human_review_gate(state: ResearchState) -> Command:
 
 
 # ============================================================
+# region_evidence_gate：区域证据充分度评分与全球主流兜底关卡
+# ============================================================
+#
+# 位置：copper_identification 完成、进入人工审核之前。对已产出的全部
+# Citation 做确定性五维评分（区域特异性/来源权威/多样性/时效/覆盖），
+# 依分档决定证据口径：
+#   sufficient → region_specific；partial → mixed；insufficient → global_proxy
+# 兜底标注是确定性代码（apply_region_fallback_marking），不重跑 agent：
+# 无区域命中的事实实体被逐条标 global_fallback，人工审核预览可见。
+
+from evidence_scoring import (  # noqa: E402  放在使用点上方，避免与图A主体逻辑交缠
+    apply_region_fallback_marking, compute_region_assessment, find_region_unsupported,
+)
+from regions import normalize_region  # noqa: E402
+from schemas import ValidationFlag  # noqa: E402
+
+
+def region_evidence_gate(state: ResearchState) -> Command:
+    region = normalize_region(state.get("region_id"))
+    citations: list[dict] = []
+    for d in state.get("dimension_proposal") or []:
+        citations.extend(d.get("evidence") or [])
+        for v in d.get("values") or []:
+            citations.extend(v.get("citations") or [])
+    for s in state.get("structure_proposal") or []:
+        citations.extend(s.get("evidence") or [])
+    for c in state.get("copper_components") or []:
+        citations.extend(c.get("citations") or [])
+
+    # s5 覆盖度：优先用 critic 顺带给出的评分，否则程序化兜底
+    # （叶子子系统被含铜部位覆盖的比例）
+    if state.get("critic_coverage_score") is not None:
+        coverage = float(state["critic_coverage_score"])
+    else:
+        parent_ids = {s.get("parent_subsystem_id")
+                      for s in state.get("structure_proposal") or []
+                      if s.get("parent_subsystem_id")}
+        leaves = [s for s in state.get("structure_proposal") or []
+                  if s.get("subsystem_id") not in parent_ids]
+        covered = sum(1 for lf in leaves
+                      if any(cc.get("parent_subsystem_id") == lf.get("subsystem_id")
+                             for cc in state.get("copper_components") or []))
+        coverage = covered / len(leaves) * 100.0 if leaves else 50.0
+    
+    assessment = compute_region_assessment(citations, region, coverage_score=coverage)
+    dims, comps = apply_region_fallback_marking(
+        state.get("dimension_proposal") or [],
+        state.get("copper_components") or [],
+        region, assessment.evidence_policy,
+    )
+    
+    # region_specific 声明必须有区域命中引用（确定性审计）：
+    # sufficient 口径下未被兜底标注却无区域命中的实体，生成
+    # region_basis_unsupported 校验标记供人工审核重点核查。
+    unsupported = find_region_unsupported(dims, comps, region)
+    audit_flags = []
+    if unsupported:
+        audit_flags.append(ValidationFlag(
+            flag_type="region_basis_unsupported",
+            description="以下实体声称 region_specific 但引用中无任何区域命中，"
+                        "请在审核时补充区域证据或确认采用全球主流口径："
+                        + "；".join(unsupported),
+            related_ids=[region.region_id] if region else [],
+            severity="warning",  # gate 确定性审计项，不阻断人工审核
+        ).model_dump())
+
+    log_entry = DebateLogEntry(
+        round=state["total_round"], speaker="supervisor",
+        message_type="routing_decision",
+        summary=f"区域证据评估：{assessment.score}分/{assessment.tier}，"
+                f"口径={assessment.evidence_policy}，"
+                f"区域命中{assessment.n_region_hits}/{assessment.n_citations}条引用；"
+                f"{assessment.summary_note}",
+    )
+    return Command(
+        goto="human_review_gate",
+        update={
+            "dimension_proposal": dims,
+            "copper_components": comps,
+            "evidence_assessment": assessment.model_dump(),
+            "evidence_policy": assessment.evidence_policy,
+            "evidence_gate_done": True,
+            "stage": "human_review",
+            "validation_flags": (state.get("validation_flags") or []) + audit_flags,
+            "debate_log": [log_entry.model_dump()],
+        },
+    )
+
+
+# ============================================================
 # 图编译
 # ============================================================
 
@@ -669,6 +802,7 @@ def build_research_graph(llm, checkpointer=None):
     g.add_node("structure_agent", lambda s: structure_agent(s, llm))
     g.add_node("critic_agent", lambda s: critic_agent(s, llm))
     g.add_node("copper_agent", lambda s: copper_agent(s, llm))
+    g.add_node("region_evidence_gate", region_evidence_gate)
     g.add_node("human_review_gate", human_review_gate)
 
     g.add_edge(START, "supervisor")

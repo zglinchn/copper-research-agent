@@ -28,8 +28,9 @@
       <label class="field-label">目标产品 <span class="hint" id="select-hint">（单选）</span></label>
       <div class="product-grid" id="product-grid"></div>
 
-      <label class="field-label" for="region">研究区域</label>
-      <input id="region" type="text" value="中国">
+      <label class="field-label" for="region">研究区域 <span class="hint">（GCAM 区域，可输入筛选）</span></label>
+      <input id="region" type="text" value="中国" list="region-list">
+      <datalist id="region-list"></datalist>
 
       <label class="field-label" for="baseline-year">调研基准年</label>
       <input id="baseline-year" type="number" value="2025" min="2000" max="2035">

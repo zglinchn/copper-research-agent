@@ -54,6 +54,7 @@ PIPELINES = {
         ("structure_agent", "结构分解"),
         ("copper_agent", "含铜部位识别"),
         ("critic_agent", "审查质询"),
+        ("region_evidence_gate", "区域证据评估"),
         ("human_review_gate", "人工审核"),
         ("done", "完成"),
     ],
@@ -61,9 +62,12 @@ PIPELINES = {
         ("start", "开始"),
         ("loader", "加载调研成果"),
         ("supervisor", "主管调度"),
+        ("baseline_agent", "基线归一化参数"),
+        ("baseline_calc_node", "基线确定性计算"),
         ("reduction_agent", "减量措施调研"),
         ("critic_agent", "审查质询"),
-        ("quant_agent", "情景与路径定量"),
+        ("quant_agent", "情景参数定义"),
+        ("calculation_node", "情景路径确定性计算"),
         ("integration", "整合输出"),
         ("done", "完成"),
     ],
@@ -91,18 +95,62 @@ class ContextAugmentedLLM:
         return _Augmented()
 
 
+class WatchdogLLM:
+    """LLM 调用级看门狗。
+
+    线上实测：mimo 网关偶发长尾挂起（经代理的长连接有心跳，httpx
+    read-timeout 永不触发，单个结构化调用可挂 40 分钟+）。本包装给每次
+    调用加总时长上限：超时即放弃当前请求并重发一个全新请求（旧线程
+    留在后台不再等待，服务进程长驻期间自然回收）。"""
+
+    DEADLINE_SECONDS = 420
+    RETRIES = 2
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def with_structured_output(self, schema):
+        inner_so = self.inner.with_structured_output(schema)
+        outer = self
+
+        class _WatchdogSO:
+            def invoke(_self, messages):
+                return outer._guarded(inner_so.invoke, messages)
+
+        return _WatchdogSO()
+
+    def invoke(self, messages):
+        return self._guarded(self.inner.invoke, messages)
+
+    def _guarded(self, fn, messages):
+        import concurrent.futures as cf
+        last = None
+        for attempt in range(self.RETRIES + 1):
+            ex = cf.ThreadPoolExecutor(max_workers=1)
+            try:
+                fut = ex.submit(fn, messages)
+                return fut.result(timeout=self.DEADLINE_SECONDS)
+            except cf.TimeoutError as exc:
+                last = exc
+                print(f"[watchdog] LLM调用超过{self.DEADLINE_SECONDS}s无响应，"
+                      f"放弃并重发（第{attempt + 1}/{self.RETRIES + 1}次）", flush=True)
+            finally:
+                ex.shutdown(wait=False)
+        raise last
+
+
 def _build_base_llm(product_name: str):
     api_key = os.environ.get("OPENAI_API_KEY")
     if api_key:
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
+        return WatchdogLLM(ChatOpenAI(
             model=os.environ.get("COPPER_MODEL", "gpt-4.1"),
             temperature=0,
             api_key=api_key,
             base_url=os.environ.get("OPENAI_BASE_URL") or None,
             timeout=300,
             max_retries=2,
-        ), "online"
+        )), "online"
     return DemoLLM(product_name=product_name), "demo"
 
 
@@ -270,10 +318,16 @@ class RunManager:
                    f"调研基准年：{run['baseline_year']}；补充约束：{run['constraints'] or '无'}。"
                    f"请在产出中遵循该口径。")
             # 在线模式且配置了TAVILY_API_KEY时，使用检索增强层（内含统一口径
-            # 注入 + 各专业agent检索前置 + 端点兼容性处理）；否则仅注入口径
+            # 注入 + 各专业agent区域化检索前置 + 端点兼容性处理）；否则仅注入口径
+            _region = None
+            try:
+                from regions import normalize_region as _norm
+                _region = _norm(run["region"])
+            except Exception:
+                _region = None
             if mode == "online" and os.environ.get("TAVILY_API_KEY"):
                 llm = RetrievalAugmentedLLM(base_llm, product_name=run["product_name"],
-                                             context_text=ctx)
+                                             context_text=ctx, region=_region)
             else:
                 llm = ContextAugmentedLLM(base_llm, ctx)
 
@@ -282,11 +336,18 @@ class RunManager:
                 init_state = {
                     "product_id": run["product_id"],
                     "product_name": run["product_name"],
+                    "region_id": run["region"],
+                    "region_name": run["region"],
                     "stage": "dimension_structure_debate",
                     "dimension_proposal": [], "dimension_version": 0,
                     "structure_proposal": [], "structure_version": 0,
                     "copper_components": [],
                     "objections": [], "debate_log": [],
+                    "evidence_assessment": None,
+                    "evidence_policy": "region_specific",
+                    "evidence_gate_done": False,
+                    "critic_coverage_score": None,
+                    "validation_flags": [],
                     "round_in_stage": 0, "total_round": 0,
                     "research_version": 1, "final_output": None,
                 }
@@ -294,13 +355,23 @@ class RunManager:
                 graph = reduction_graph.build_reduction_graph(llm, checkpointer=MemorySaver())
                 init_state = {
                     "product_id": run["product_id"],
+                    "region_id": run["region"],
+                    "region_name": run["region"],
+                    "evidence_policy": (run.get("research_output") or {}).get(
+                        "evidence_assessment", {}).get("evidence_policy", "region_specific")
+                        if isinstance(run.get("research_output"), dict) else "region_specific",
                     "research_output": run["research_output"],
                     "analysis_run_id": run["analysis_run_id"],
                     "baseline_year": run["baseline_year"],
-                    "stage": "reduction_research",
-                    "reduction_measures": [], "scenarios": [], "trajectory": [],
+                    "stage": "baseline_quantification",
+                    "baseline_params": None, "model_baselines": [],
+                    "baseline_calc_method": "",
+                    "reduction_measures": [], "scenario_params": [],
+                    "scenarios": [], "trajectory": [],
                     "functional_unit_candidates": [], "chosen_functional_unit": "",
                     "baseline_unit_intensity": None,
+                    "calculation_params": None, "calculation_violations": [],
+                    "baseline_retry_used": False,
                     "amendment_requests": [], "objections": [], "debate_log": [],
                     "round_in_stage": 0, "total_round": 0, "final_output": None,
                 }
@@ -431,6 +502,8 @@ class RunManager:
         run["current_node"] = node
         self._persist(run)
 
+        if not isinstance(update, dict):
+            update = {}  # 部分节点无 state 变更时 updates 流可能给 None
         summary = ""
         log = update.get("debate_log") if isinstance(update, dict) else None
         if log:

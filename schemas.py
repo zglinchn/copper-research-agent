@@ -69,6 +69,12 @@ class DimensionCategory(str, Enum):
     OTHER = "other"
 
 
+# 区域依据标记：每条事实性结论必须声明自己是"目标区域特有证据"还是
+# "区域证据不足时的全球主流型号替代"——这是国家区分度在数据层的落点，
+# 也是导出/计算时识别兜底数据的唯一依据。
+RegionBasis = Literal["region_specific", "global_fallback"]
+
+
 # ============================================================
 # 树1：分类维度体系（型号 = 多维度的笛卡尔组合，而非单一枚举）
 # ============================================================
@@ -85,9 +91,22 @@ class DimensionValue(BaseModel):
     )
     prevalence_desc: Optional[str] = Field(
         default=None,
-        description="定性描述市场地位，如'当前主流'/'新兴技术'/'区域性主流'，禁止编造具体数字市占率"
+        description="定性描述市场地位，如'当前主流'/'新兴技术'/'区域性主流'；"
+                    "数值份额请填market_share字段并附Citation，此处禁止编造数字"
     )
     typical_spec_range: Optional[str] = None
+    market_share: Optional[QuantValue] = Field(
+        default=None,
+        description="该取值在目标区域的市场占有率(0-100%)，对应模板Section2「市场占有率(%)」列；"
+                    "必须附至少一条Citation，并用market_share_caliber/year说明口径与年份；"
+                    "无可靠数值时留空，仅用prevalence_desc定性描述"
+    )
+    market_share_caliber: Optional[str] = Field(
+        default=None, description="市场占有率统计口径，如'中国电池技术路线市场占比'")
+    market_share_year: Optional[int] = Field(default=None, description="市场占有率统计年份")
+    region_basis: RegionBasis = "region_specific"
+    region_basis_note: Optional[str] = Field(
+        default=None, description="region_basis=global_fallback时必须说明全球主流替代的理由")
     citations: list[Citation] = Field(default_factory=list)
 
 
@@ -233,6 +252,15 @@ class CopperComponent(BaseModel):
         default=None,
         description="该铜部件是否存在已知可替代技术路线(为后续减量化措施预留标记)"
     )
+    regional_presence: Optional[QuantValue] = Field(
+        default=None,
+        description="目标区域实际采用该铜形态的市场比例(0-100%)，None视为100%。"
+                    "区域材料选型分支的载体：如某区域铝绕组路线占40%，"
+                    "则铜绕组部件在此区域的presence为60%，基线强度按此加权"
+    )
+    region_basis: RegionBasis = "region_specific"
+    region_basis_note: Optional[str] = Field(
+        default=None, description="region_basis=global_fallback时必须说明全球主流替代的理由")
     citations: list[Citation] = Field(default_factory=list)
 
 
@@ -278,6 +306,9 @@ class CopperReductionMeasure(BaseModel):
     )
     maturity: Literal["commercial", "pilot", "lab", "concept"]
     earliest_feasible_year: int
+    region_basis: RegionBasis = "region_specific"
+    region_basis_note: Optional[str] = Field(
+        default=None, description="region_basis=global_fallback时必须说明全球主流替代的理由")
     engineering_case: EngineeringCase
     additional_citations: list[Citation] = Field(default_factory=list)
 
@@ -349,6 +380,9 @@ class Scenario(BaseModel):
     )
     scenario_rationale: str = Field(description="为什么这样设定Δmax/达成节奏，需要引用支撑")
     notes: Optional[str] = None
+    region_basis: RegionBasis = "region_specific"
+    region_basis_note: Optional[str] = Field(
+        default=None, description="region_basis=global_fallback时必须说明全球主流替代的理由")
     citations: list[Citation] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -385,6 +419,125 @@ class IntensityTrajectoryPoint(BaseModel):
 
 
 # ============================================================
+# 区域证据评估 与 确定性计算参数载体
+# ============================================================
+
+class RegionEvidenceAssessment(BaseModel):
+    """区域证据充分度评估（region_evidence_gate 程序化评分产出）。
+
+    决定本次运行的证据口径：区域证据足够→region_specific；
+    部分→mixed（字段级混合标注）；不足→global_proxy（全球主流型号兜底）。
+    """
+    region_id: str
+    score: float = Field(description="综合评分0-100")
+    tier: Literal["sufficient", "partial", "insufficient"]
+    component_scores: dict[str, float] = Field(
+        default_factory=dict,
+        description="分项得分：s1_region_specificity/s2_source_authority/"
+                    "s3_source_diversity/s4_recency/s5_coverage"
+    )
+    evidence_policy: Literal["region_specific", "mixed", "global_proxy"] = "region_specific"
+    n_region_hits: int = 0
+    n_citations: int = 0
+    summary_note: str = ""
+
+
+class NormalizationFactor(BaseModel):
+    """单个型号取值的归一化换算因子（baseline_agent 提出，带引用）。
+
+    factor = 单台/单件产品对应的功能单位数量（如 MWp/台、MW/台、台/套）。
+    强度换算：intensity = Σ(部件铜质量 × presence/100) / factor。
+    """
+    value_id: str
+    value_name: str
+    factor: float = Field(gt=0, description="单台产品对应的功能单位数量，如0.000635 MWp/台")
+    unit_note: str = Field(description="因子单位与换算口径说明，如'单台额定功率635Wp'")
+    citations: list[Citation] = Field(default_factory=list)
+
+
+class HighCopperReference(BaseModel):
+    """每个子类别的高铜参考配置选择（baseline_agent 提出，带引用）。
+
+    基线比较基准：同一applicable_scope下的减量潜力统一相对该配置计算。
+    """
+    applicable_scope: Optional[str] = None
+    chosen_value_id: str = Field(description="被选为该子类别高铜参考配置的型号value_id")
+    rationale: str = Field(description="为什么选它作高铜参考（如'铜绕组路线、含铜量最高的主流配置'）")
+    citations: list[Citation] = Field(default_factory=list)
+
+
+class BaselineParams(BaseModel):
+    """baseline_agent（定量分析师第0步）的输出契约：只提参数，不算数字。"""
+    functional_unit_candidates: list[str]
+    functional_unit_rationale: str
+    chosen_functional_unit: str
+    normalization_factors: list[NormalizationFactor]
+    high_copper_references: list[HighCopperReference] = Field(
+        description="每个applicable_scope（含None）恰好一条高铜参考配置选择"
+    )
+    citations: list[Citation] = Field(default_factory=list)
+
+
+class ComponentWeight(BaseModel):
+    """型号基线中单个含铜部件的质量与构成权重（确定性计算产出）"""
+    component_id: str
+    component_name: str
+    mass: float = Field(description="unit_mass × regional_presence/100 后的有效铜质量")
+    mass_unit: str
+    weight_pct: float = Field(description="占该型号基线总铜质量的百分比，同型号内合计=100")
+
+
+class ModelBaselineIntensity(BaseModel):
+    """减量前单位铜强度（模板Section3行载体，calculate.py 确定性产出）"""
+    value_id: str
+    value_name: str
+    applicable_scope: Optional[str] = None
+    functional_unit: str
+    intensity: QuantValue = Field(description="减量前单位铜强度 = Σ有效铜质量 / 归一化因子")
+    component_weights: list[ComponentWeight] = Field(default_factory=list)
+    is_reference: bool = Field(
+        default=False, description="是否为该子类别的高铜参考配置（S0比较基准）")
+    high_copper_reference_note: Optional[str] = None
+    region_basis: RegionBasis = "region_specific"
+    region_basis_note: Optional[str] = None
+    calc_trace: str = Field(default="", description="确定性计算公式与输入摘要，供审计/备注列")
+    citations: list[Citation] = Field(default_factory=list)
+
+
+class ScenarioParams(BaseModel):
+    """quant_agent 的情景输出契约：只含参数，不含Δmax——
+    Δmax 由 calculate.py 根据措施组合与部件质量权重确定性算出。"""
+    scenario_id: ScenarioCode
+    scenario_name: str
+    applicable_scope: Optional[str] = None
+    scenario_definition: str
+    included_measure_ids: list[str] = Field(default_factory=list)
+    measure_start_year: int
+    target_achievement_year: int
+    target_achievement_rate_pct: float = Field(description="target_achievement_year当年的实现率(0-100)")
+    diffusion_method: Literal["linear", "s_curve", "step", "other"]
+    scenario_rationale: str
+    notes: Optional[str] = None
+    citations: list[Citation] = Field(default_factory=list)
+
+
+class CalculationParams(BaseModel):
+    """代码组装的确定性计算输入（calculate.py 的唯一入参契约）。
+
+    components/measures 为对应 Pydantic 实体的 model_dump 快照，
+    其中 expected_reduction 语义固化为"目标部件铜质量降低%"。
+    """
+    functional_unit: str
+    normalization_note: str = ""
+    baseline_year: int
+    horizon_year: int = 2035
+    components: list[dict] = Field(default_factory=list)
+    measures: list[dict] = Field(default_factory=list)
+    scenario_params: list[ScenarioParams] = Field(default_factory=list)
+    model_baselines: list[ModelBaselineIntensity] = Field(default_factory=list)
+
+
+# ============================================================
 # 校验实体：把"概念混淆"变成可编程检测
 # ============================================================
 
@@ -399,6 +552,7 @@ class ValidationFlag(BaseModel):
         "scenario_severity_ordering_violation",  # S0<S1<S2<S3的减量力度排序被违反
         "incomplete_scenario_set",     # 某子类别下未凑齐S0-S3四个情景
         "duplicate_scenario_entry",    # 同一子类别下同一scenario_id出现了多次
+        "region_basis_unsupported",    # 声称region_specific却无任何区域命中引用
         "other",
     ]
     description: str
@@ -415,6 +569,7 @@ class ValidationFlag(BaseModel):
 AgentRole = Literal[
     "supervisor", "dimension_agent", "structure_agent",
     "copper_agent", "reduction_agent", "critic_agent", "quant_agent",
+    "baseline_agent",
 ]
 
 
@@ -434,7 +589,7 @@ class Objection(BaseModel):
         "scenario_severity_ordering_violation",  # S0<S1<S2<S3的减量力度排序被违反
         "incomplete_scenario_set",     # 某子类别下未凑齐S0-S3四个情景
         "duplicate_scenario_entry",    # 同一子类别下同一scenario_id出现了多次
-        "insufficient_evidence_quality", "scope_creep", "other",
+        "insufficient_evidence_quality", "scope_creep", "region_basis_unsupported", "other",
     ]
     detail: str = Field(description="具体到可执行的修改要求，而不是笼统的'有问题'。"
                         "若flag_type为dimension_value_axis_mismatch，必须点名具体是"
@@ -501,6 +656,12 @@ class CriticReview(BaseModel):
     实际影响。reopened_objection_ids就是这个渠道。
     """
     new_objections: list[Objection] = Field(default_factory=list)
+    evidence_coverage_score: Optional[int] = Field(
+        default=None,
+        description="【仅调研图critic填写】现有证据对产品主要子系统/材料路线的覆盖度"
+                    "评分0-100，供region_evidence_gate的s5分项使用；不填则由代码按"
+                    "叶子子系统覆盖率兜底计算"
+    )
     reopened_objection_ids: list[str] = Field(
         default_factory=list,
         description="复核后认为对方的response_note并未真正解决问题、需要重新打开"
@@ -547,6 +708,8 @@ class ProductResearchOutput(BaseModel):
     """
     product_id: str
     product_name: str
+    region_id: str = "unknown"
+    region_name: str = "unknown"
     research_version: int = 1
     research_status: Literal[
         "draft", "pending_human_review", "approved", "amendment_in_progress",
@@ -566,6 +729,8 @@ class ProductResearchOutput(BaseModel):
         default_factory=list, description="调研阶段全部交锋记录(仅事实/概念类质询，不含措施证据类)"
     )
     debate_log: list[DebateLogEntry] = Field(default_factory=list)
+    evidence_assessment: Optional[RegionEvidenceAssessment] = Field(
+        default=None, description="区域证据充分度评估（region_evidence_gate产出）")
 
     @model_validator(mode="after")
     def _cross_reference_integrity(self):
@@ -632,6 +797,8 @@ class AmendmentRequest(BaseModel):
 
 class ProductReductionModel(BaseModel):
     product_id: str
+    region_id: str = "unknown"
+    region_name: str = "unknown"
     based_on_research_version: int = Field(
         description="本次减量化分析所依据的ProductResearchOutput版本号，用于追溯"
     )
@@ -648,6 +815,10 @@ class ProductReductionModel(BaseModel):
     reduction_measures: list[CopperReductionMeasure]
     scenarios: list[Scenario]
     trajectory: list[IntensityTrajectoryPoint]
+    model_baselines: list[ModelBaselineIntensity] = Field(
+        default_factory=list, description="减量前单位铜强度（模板Section3，确定性计算产出）")
+    evidence_assessment: Optional[RegionEvidenceAssessment] = Field(
+        default=None, description="继承自父调研成果的区域证据评估（integration阶段由代码复制）")
 
     amendment_requests: list[AmendmentRequest] = Field(default_factory=list)
     validation_flags: list[ValidationFlag] = Field(default_factory=list)

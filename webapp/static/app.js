@@ -41,9 +41,54 @@ async function init() {
   state.meta = await fetch("/api/meta").then(r => r.json());
   renderModeBadge();
   renderProducts();
+  loadRegionOptions();
   bindEvents();
   refreshHistory();
   state.historyTimer = setInterval(refreshHistory, 3000);
+}
+
+/* GCAM 区域下拉（datalist）：/api/regions 注册表填充，保留自由文本兜底 */
+async function loadRegionOptions() {
+  try {
+    const data = await fetch("/api/regions").then(r => r.json());
+    const dl = $("region-list");
+    if (!dl) return;
+    dl.innerHTML = (data.regions || [])
+      .map(r => `<option value="${esc(r.name_cn)}">${esc(r.region_id)} / ${esc((r.members || []).slice(0, 4).join("、"))}</option>`)
+      .join("");
+  } catch (e) { /* 区域列表不可用时不阻断页面 */ }
+}
+
+/* 区域证据与确定性基线卡片（调研 run 的 assessment / 图B run 的基线） */
+function renderRegionBaseline(result) {
+  const a = result.evidence_assessment;
+  const badge = (tier) => ({ sufficient: "badge-ok", partial: "badge-warn",
+                             insufficient: "badge-fallback" }[tier] || "badge-warn");
+  const tierCn = { sufficient: "证据充足", partial: "部分充足", insufficient: "证据不足" };
+  const part = [];
+  if (a) {
+    part.push(`<div class="region-card">
+      <h4>区域证据评估 <span class="cat-badge ${badge(a.tier)}">${tierCn[a.tier] || a.tier} · ${a.score}分</span></h4>
+      <div class="axis"><b>证据口径：</b>${esc(a.evidence_policy)} ·
+        区域命中 ${a.n_region_hits}/${a.n_citations} 条引用<br>
+        <b>分项：</b>${Object.entries(a.component_scores || {})
+          .map(([k, v]) => `${esc(k.split("_")[0])}=${v}`).join(" / ")}<br>
+        ${esc(a.summary_note || "")}</div></div>`);
+  }
+  if (result.model_baselines) {
+    const bi = result.baseline_unit_intensity || {};
+    part.push(`<div class="region-card">
+      <h4>减量前单位铜强度（确定性计算）</h4>
+      <div class="axis"><b>功能单位：</b>${esc(result.chosen_functional_unit || "－")} ·
+        <b>主基线：</b>${bi.value ?? "－"} ${esc(bi.unit || "")}<br>
+        ${esc(result.baseline_calc_method || "")}<br>
+        ${"<table class=\"mini-table\"><tr><th>型号</th><th>子类别</th><th>强度</th><th>高铜参考</th></tr>" +
+          (result.model_baselines || []).map(b =>
+            `<tr><td>${esc(b.value_name)}</td><td>${esc(b.applicable_scope || "(无子类别)")}</td>` +
+            `<td>${b.intensity.value} ${esc(b.intensity.unit)}</td>` +
+            `<td>${b.is_reference ? "是" : "否"}</td></tr>`).join("") + "</table>"}</div></div>`);
+  }
+  return part.join("") || "<div class=\"empty\">无区域/基线信息</div>";
 }
 
 function renderModeBadge() {
@@ -534,6 +579,9 @@ function renderResult(run) {
   const isReduction = !!result.reduction_measures;
 
   const tabs = [];
+  if (result.classification_dimensions || result.evidence_assessment || result.model_baselines) {
+    tabs.push(["region", "区域与基线"]);
+  }
   if (result.classification_dimensions) {
     tabs.push(["dims", "分类维度体系"], ["tree", "结构分解"], ["copper", "含铜部位"]);
   }
@@ -551,7 +599,8 @@ function renderResult(run) {
 
   const body = $("result-body");
   const t = state.resultTab;
-  if (t === "dims") body.innerHTML = renderDims(result.classification_dimensions || []);
+  if (t === "region") body.innerHTML = renderRegionBaseline(result);
+  else if (t === "dims") body.innerHTML = renderDims(result.classification_dimensions || []);
   else if (t === "tree") body.innerHTML = renderTree(result);
   else if (t === "copper") body.innerHTML = renderCopper(result.copper_components || []);
   else if (t === "measures") body.innerHTML = renderMeasures(result.reduction_measures || []);
@@ -611,6 +660,7 @@ function renderReviewBody(preview) {
       <div class="review-section-body">${inner}</div>
     </details>`;
   body.innerHTML = [
+    preview.evidence_assessment ? section(true, `⓪ 区域证据与基线`, renderRegionBaseline(preview)) : "",
     section(true, `① 分类维度体系（${(preview.classification_dimensions || []).length} 组，重点检查同轴一致性）`,
       renderDims(preview.classification_dimensions || [])),
     section(false, `② 功能子系统结构树（${(preview.functional_subsystems || []).length} 个）`,

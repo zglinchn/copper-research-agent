@@ -60,6 +60,16 @@ from export_excel import export_run_to_xlsx
 app = FastAPI(title="铜产品减量化模型智能体", version="1.0.0")
 manager = RunManager()
 
+
+@app.get("/api/regions")
+def list_regions():
+    """GCAM 区域注册表（前端区域 datalist/下拉）"""
+    try:
+        from regions import region_options
+        return {"regions": region_options()}
+    except Exception as exc:
+        raise HTTPException(500, f"区域注册表加载失败: {exc}")
+
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 

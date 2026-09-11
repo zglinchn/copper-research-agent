@@ -24,7 +24,8 @@ from schemas import (
     FunctionalSubsystem, CopperComponent, QuantValue, Citation,
     CriticReview, SupervisorDecision,
     CopperReductionMeasure, EngineeringCase, Scenario,
-    IntensityTrajectoryPoint,
+    IntensityTrajectoryPoint, BaselineParams, NormalizationFactor,
+    HighCopperReference, ScenarioParams,
 )
 from reduction_graph import ReductionAgentOutput
 
@@ -75,8 +76,12 @@ class _DemoStructured:
             return self._demo_copper(text)
         if elem is Scenario:
             return self._demo_scenarios(text)
+        if elem is ScenarioParams:
+            return self._demo_scenario_params(text)
         if elem is IntensityTrajectoryPoint:
             return self._demo_trajectory(text)
+        if self.schema is BaselineParams:
+            return self._demo_baseline_params(text)
         if self.schema is CriticReview:
             return CriticReview()  # 演示模式：critic始终一轮通过
         if self.schema is SupervisorDecision:
@@ -164,7 +169,7 @@ class _DemoStructured:
                 component_name="导电/电磁功能部件（演示占位）",
                 copper_form="copper_winding",
                 function_of_copper="演示数据：利用铜的导电性（占位描述）。",
-                unit_mass=QuantValue(value=0.0, unit="kg（演示占位）"),
+                unit_mass=QuantValue(value=1.0, unit="kg（演示占位）"),
                 mass_data_basis="engineering_estimate",
                 citations=[_DEMO_CITE],
             )
@@ -206,6 +211,16 @@ class _DemoStructured:
                 maturity="lab", earliest_feasible_year=2030,
                 engineering_case=case, additional_citations=[_DEMO_CITE],
             ),
+            CopperReductionMeasure(
+                measure_id="R03", measure_name="工艺改进（演示占位）",
+                target_component_ids=targets[:1] or targets,
+                mechanism="演示数据：工艺改进机理占位描述。",
+                mechanism_category="manufacturing_process",
+                expected_reduction=QuantValue(value=3, unit="%"),
+                trade_offs="演示数据：良率权衡占位描述。",
+                maturity="lab", earliest_feasible_year=2031,
+                engineering_case=case, additional_citations=[_DEMO_CITE],
+            ),
         ]
         return ReductionAgentOutput(measures=measures, amendment_requests=[])
 
@@ -240,6 +255,72 @@ class _DemoStructured:
                 scenario_rationale="演示数据：情景依据占位描述。", citations=[_DEMO_CITE],
             ))
         return scenarios
+
+    # --------------------------------------------------------
+    # 基线归一化参数（图B stage 0）：只提参数不算数
+    # --------------------------------------------------------
+    def _demo_baseline_params(self, text: str) -> BaselineParams:
+        # 兼容两种格式：persona 中的 "- v1 / 型号一" 行 与 dict dump 的 'value_id': 'v1'
+        value_ids = list(dict.fromkeys(
+            re.findall(r"^-\s*([\w-]+)\s*/", text, re.M)
+            + re.findall(r"'value_id': '([^']+)'", text))) or ["v-demo"]
+        return BaselineParams(
+            functional_unit_candidates=["kg/演示功能单位"],
+            functional_unit_rationale="演示数据：占位功能单位口径。",
+            chosen_functional_unit="kg/演示功能单位",
+            normalization_factors=[
+                NormalizationFactor(
+                    value_id=vid, value_name=f"型号{vid}", factor=1.0,
+                    unit_note="演示：单台=1演示功能单位 → 1演示功能单位/台",
+                    citations=[_DEMO_CITE],
+                )
+                for vid in value_ids
+            ],
+            high_copper_references=[
+                HighCopperReference(
+                    applicable_scope=None, chosen_value_id=value_ids[0],
+                    rationale="演示数据：首个型号作为高铜参考配置占位。",
+                    citations=[_DEMO_CITE],
+                ),
+            ],
+            citations=[_DEMO_CITE],
+        )
+
+    # --------------------------------------------------------
+    # 情景参数（图B quantification）：只含参数，Δmax 交给代码
+    # --------------------------------------------------------
+    def _demo_scenario_params(self, text: str):
+        m = re.search(r"基准年:\s*(\d{4})", text)
+        base_year = int(m.group(1)) if m else 2025
+        measure_ids = list(dict.fromkeys(re.findall(r"'measure_id': '([^']+)'", text)))
+        m1 = measure_ids[:1]
+        m2 = measure_ids[:2]
+        m3 = measure_ids[:3] or measure_ids
+        specs = [
+            ("S1", m1, 80),
+            ("S2", m2, 90),
+            ("S3", m3, 100),
+        ]
+        params = [ScenarioParams(
+            scenario_id="S0", scenario_name="基准情景", applicable_scope=None,
+            scenario_definition="高铜技术参考配置，不额外实施减铜措施（演示占位）",
+            included_measure_ids=[], measure_start_year=base_year,
+            target_achievement_year=base_year, target_achievement_rate_pct=0,
+            diffusion_method="linear", scenario_rationale="演示数据：S0固定为比较基准。",
+            citations=[_DEMO_CITE],
+        )]
+        for sid, included, rate in specs:
+            params.append(ScenarioParams(
+                scenario_id=sid,
+                scenario_name={"S1": "普通减量", "S2": "加速减量", "S3": "深度减量"}[sid],
+                applicable_scope=None,
+                scenario_definition=f"演示数据：{sid}情景定义占位",
+                included_measure_ids=included,
+                measure_start_year=base_year, target_achievement_year=2035,
+                target_achievement_rate_pct=rate, diffusion_method="linear",
+                scenario_rationale="演示数据：情景依据占位描述。", citations=[_DEMO_CITE],
+            ))
+        return params
 
     # --------------------------------------------------------
     # 强度路径：每年×每情景一个点，与Δmax×实现率保持数学一致
@@ -294,6 +375,15 @@ class _DemoStructured:
                                        reasoning="演示：调研阶段完成，转入人工审核",
                                        termination_reason="演示：调研阶段完成，转入人工审核")
 
+        if stage == "baseline_quantification":
+            if "BaselineAgent: 未产出" in text:
+                return SupervisorDecision(next_agent="baseline_agent", reasoning="演示：基线归一化参数尚未产出")
+            if round_in_stage < 1:
+                return SupervisorDecision(next_agent="critic_agent", reasoning="演示：基线参数已产出，交由critic审查")
+            return SupervisorDecision(next_agent="critic_agent", should_terminate=True,
+                                       reasoning="演示：基线参数审查通过，进入确定性基线计算",
+                                       termination_reason="演示：基线参数审查通过")
+
         if stage == "reduction_research":
             if "ReductionAgent: 未产出" in text:
                 return SupervisorDecision(next_agent="reduction_agent", reasoning="演示：减量化措施尚未产出")
@@ -302,13 +392,13 @@ class _DemoStructured:
             return SupervisorDecision(next_agent="quant_agent", reasoning="演示：措施审查通过，进入定量建模")
 
         if stage == "quantification":
-            if "QuantAgent(情景+路径): 未产出" in text:
-                return SupervisorDecision(next_agent="quant_agent", reasoning="演示：情景尚未产出")
+            if "QuantAgent: 未产出" in text:
+                return SupervisorDecision(next_agent="quant_agent", reasoning="演示：情景参数尚未产出")
             if round_in_stage < 1:
-                return SupervisorDecision(next_agent="critic_agent", reasoning="演示：情景已产出，交由critic审查排序")
+                return SupervisorDecision(next_agent="critic_agent", reasoning="演示：情景参数已产出，交由critic审查排序")
             return SupervisorDecision(next_agent="critic_agent", should_terminate=True,
-                                       reasoning="演示：情景与路径建模完成，进入整合",
-                                       termination_reason="演示：情景与路径建模完成，进入整合")
+                                       reasoning="演示：情景参数审查通过，进入确定性情景/路径计算",
+                                       termination_reason="演示：情景参数审查通过，进入计算")
 
         return SupervisorDecision(next_agent="critic_agent", should_terminate=True,
                                    reasoning="演示：流程结束",

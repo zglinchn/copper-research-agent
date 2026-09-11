@@ -15,6 +15,7 @@ Section 6 强度路径由 calculate.py 确定性计算后批量写入（模板�
 
 from __future__ import annotations
 import io
+from copy import copy
 from pathlib import Path
 
 import openpyxl
@@ -36,6 +37,7 @@ TITLE_FILL = PatternFill("solid", fgColor="1F4E78")
 SECTION_FILL = PatternFill("solid", fgColor="2E75B6")
 HEADER_FILL = PatternFill("solid", fgColor="D9E1F2")
 FIXED_FILL = PatternFill("solid", fgColor="F2F2F2")
+RESULT_FILL = PatternFill("solid", fgColor="E2F0D9")
 
 THIN = Side(style="thin", color="BFBFBF")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -228,12 +230,37 @@ def export_run_to_xlsx(run: dict) -> bytes:
     ws_in = tpl["Template"]
     ncols = ws_in.max_column
 
+    # 模板是样式的唯一事实源。输出行数会随研究结果变化，不能直接复制整行，
+    # 但可以把模板中的行样式复制到对应的输出行，确保正文填充色、字体、边框、
+    # 对齐方式和行高与模板保持一致。
+    style_rows = {
+        "title": 1,
+        "note": 2,
+        "field": 5,
+        "section": 4,
+        "header": {
+            2: 16,
+            3: 22,
+            4: 29,
+            5: 35,
+            6: 42,
+        },
+        "data": {
+            2: 17,
+            3: 23,
+            4: 30,
+            5: 36,
+            6: 43,
+        },
+    }
+
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     ws = wb.create_sheet("Template")
     ws.sheet_view.showGridLines = False
     for col in range(1, ncols + 1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 18
+        letter = openpyxl.utils.get_column_letter(col)
+        ws.column_dimensions[letter].width = ws_in.column_dimensions[letter].width
 
     section1_values = _section1_values(run, result, is_reduction)
     section_rows = {
@@ -294,39 +321,46 @@ def export_run_to_xlsx(run: dict) -> bytes:
         if kind == "blank":
             continue
         if kind == "title":
-            _write_merged(ws, out_row, op[1], TITLE_FONT, TITLE_FILL, ncols, center=True)
+            _write_merged(ws, out_row, op[1], ncols, ws_in, style_rows["title"], center=True)
         elif kind == "note":
-            _write_merged(ws, out_row, op[1], NOTE_FONT, FIXED_FILL, ncols)
+            note_row = style_rows["note"]
+            if op[1].startswith("【重要】"):
+                note_row = 15
+            elif op[1].startswith("高铜技术"):
+                note_row = 26
+            elif op[1].startswith("本节数据"):
+                note_row = 41
+            _write_merged(ws, out_row, op[1], ncols, ws_in, note_row)
         elif kind == "section":
-            _write_merged(ws, out_row, op[1], SECTION_FONT, SECTION_FILL, ncols)
+            _write_merged(ws, out_row, op[1], ncols, ws_in, style_rows["section"])
         elif kind == "field":
+            _copy_row_style(ws, ws_in, out_row, style_rows["field"], ncols)
             lc = ws.cell(row=out_row, column=1, value=op[1])
-            _style(lc, font=HEADER_FONT, fill=FIXED_FILL)
             ws.merge_cells(start_row=out_row, start_column=2,
                            end_row=out_row, end_column=ncols)
             vc = ws.cell(row=out_row, column=2,
                          value=op[2] if op[2] is not None else "－")
-            _style(vc)
         elif kind == "header":
+            _copy_row_style(ws, ws_in, out_row, style_rows["header"][op[1]], ncols)
             for i, v in enumerate(op[2], start=1):
-                c = ws.cell(row=out_row, column=i, value=v)
-                _style(c, font=HEADER_FONT, fill=HEADER_FILL)
+                ws.cell(row=out_row, column=i, value=v)
         elif kind == "data":
             out_row -= 1  # 数据行占多行，下面自行推进
             for row_vals in op[2]:
                 out_row += 1
+                _copy_row_style(ws, ws_in, out_row,
+                                style_rows["data"][op[1]], ncols)
                 for j, v in enumerate(row_vals, start=1):
-                    c = ws.cell(row=out_row, column=j,
-                                value=v if v is not None else "－")
-                    _style(c)
+                    ws.cell(row=out_row, column=j,
+                            value=v if v is not None else "－")
 
     # 附表：校验标记与质询记录
     out_row = ws.max_row + 2
-    _write_merged(ws, out_row, "附：校验标记与质询记录", SECTION_FONT, SECTION_FILL, ncols)
+    _write_merged(ws, out_row, "附：校验标记与质询记录", ncols, ws_in, style_rows["section"])
     out_row += 1
     for i, h in enumerate(["类型", "级别", "描述", "关联ID", "状态"], start=1):
-        c = ws.cell(row=out_row, column=i, value=h)
-        _style(c, font=HEADER_FONT, fill=HEADER_FILL)
+        _copy_cell_style(ws.cell(row=out_row, column=i), ws_in.cell(row=16, column=i))
+        ws.cell(row=out_row, column=i, value=h)
     out_row += 1
     for f in result.get("validation_flags") or []:
         for j, v in enumerate(["校验标记", f.get("severity"), f.get("description"),
@@ -346,12 +380,44 @@ def export_run_to_xlsx(run: dict) -> bytes:
     return buf.getvalue()
 
 
-def _write_merged(ws, row, text, font, fill, ncols, center=False):
+def _copy_cell_style(dst, src):
+    # 不能直接复制 _style：模板与新工作簿各自维护样式表，直接复制会产生
+    # 无效的样式索引。逐项复制可跨工作簿保留完整视觉样式。
+    dst.font = copy(src.font)
+    dst.fill = copy(src.fill)
+    dst.border = copy(src.border)
+    dst.alignment = copy(src.alignment)
+    dst.protection = copy(src.protection)
+    dst.number_format = src.number_format
+
+
+def _copy_row_style(ws, ws_in, out_row, template_row, ncols):
+    if ws_in.row_dimensions[template_row].height is not None:
+        ws.row_dimensions[out_row].height = ws_in.row_dimensions[template_row].height
+    for col in range(1, ncols + 1):
+        dst = ws.cell(row=out_row, column=col)
+        src = ws_in.cell(row=template_row, column=col)
+        _copy_cell_style(dst, src)
+        # 模板中的橙色只表示“示例数据”。实际运行结果保留数据区的
+        # 颜色层次，但改用绿色结果色，避免把真实结果误标为示例。
+        if src.fill.fill_type == "solid":
+            rgb = getattr(src.fill.fgColor, "rgb", None)
+            if isinstance(rgb, str) and rgb.endswith(EXAMPLE_RGB_SUFFIX):
+                dst.fill = copy(RESULT_FILL)
+
+
+def _write_merged(ws, row, text, ncols, ws_in, template_row, center=False):
+    _copy_row_style(ws, ws_in, row, template_row, ncols)
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=ncols)
     c = ws.cell(row=row, column=1, value=text)
-    _style(c, font=font, fill=fill)
     if center:
-        c.alignment = Alignment(vertical="center", horizontal="center")
+        c.alignment = copy(c.alignment)
+        c.alignment = Alignment(vertical=c.alignment.vertical,
+                                horizontal="center",
+                                wrap_text=c.alignment.wrap_text,
+                                text_rotation=c.alignment.text_rotation,
+                                shrink_to_fit=c.alignment.shrink_to_fit,
+                                indent=c.alignment.indent)
 
 
 def _section1_values(run: dict, result: dict, is_reduction: bool) -> dict:

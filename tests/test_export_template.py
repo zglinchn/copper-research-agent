@@ -210,3 +210,16 @@ def test_research_run_export_sections_1_to_3():
     assert "措施ID" in col1  # 节结构保留（无数据行）
     i2 = col1.index("分类维度名称") + 1
     assert ws.cell(row=i2 + 1, column=3).value == "TOPCon晶硅组件"
+
+
+def test_export_preserves_visual_data_band():
+    """实际数据行应保留模板的数据区色带，而不是退化成无填充白底。"""
+    wb = _read(export_run_to_xlsx(_run("reduction", _reduction_result(), _research_result())))
+    ws = wb.active
+    section_headers = {ws.cell(row=r, column=1).value: r
+                       for r in range(1, ws.max_row + 1)}
+    for marker in ("分类维度名称", "型号/取值名称", "措施ID", "情景代码", "年份"):
+        header_row = section_headers[marker]
+        data_cell = ws.cell(row=header_row + 1, column=1)
+        assert data_cell.fill.fill_type == "solid"
+        assert data_cell.fill.fgColor.rgb.endswith("E2F0D9")

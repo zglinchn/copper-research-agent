@@ -16,6 +16,7 @@ const state = {
   typingTimer: null,
   pollTimer: null,
   historyTimer: null,
+  historyFilter: "all",  // all | success | failure
 };
 
 const STATUS_TEXT = {
@@ -166,6 +167,10 @@ function bindEvents() {
   $("btn-approve").onclick = () => submitReview(true);
   $("btn-reject").onclick = () => submitReview(false);
   $("btn-reduction").onclick = startReduction;
+  $("history-filter").onchange = (e) => {
+    state.historyFilter = e.target.value;
+    refreshHistory();
+  };
 }
 
 /* ================= 运行控制 ================= */
@@ -856,13 +861,26 @@ function quantText(q) {
 
 /* ================= 运行历史 ================= */
 
+// 与后端 runner.run_outcome 同口径：completed=成功；failed/cancelled/interrupted=失败
+function runOutcome(status) {
+  if (status === "completed") return "success";
+  if (["failed", "cancelled", "interrupted"].includes(status)) return "failure";
+  return "running";
+}
+
 async function refreshHistory() {
   const res = await fetch("/api/runs");
   if (!res.ok) return;
   const data = await res.json();
   const list = $("history-list");
-  if (!data.runs.length) { list.innerHTML = `<div class="empty">暂无运行记录</div>`; return; }
-  list.innerHTML = data.runs.map(r => {
+  const runs = state.historyFilter === "all"
+    ? data.runs
+    : data.runs.filter(r => runOutcome(r.status) === state.historyFilter);
+  if (!runs.length) {
+    list.innerHTML = `<div class="empty">${data.runs.length ? "该筛选条件下暂无运行记录" : "暂无运行记录"}</div>`;
+    return;
+  }
+  list.innerHTML = runs.map(r => {
     const st = STATUS_TEXT[r.status] || r.status;
     const active = r.run_id === state.currentRunId;
     const icon = { research: "🔍", reduction: "📉" }[r.graph_type] || "•";

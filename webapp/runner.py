@@ -74,6 +74,18 @@ PIPELINES = {
 }
 
 MAX_EVENTS = 300
+# 运行历史配额：成功/失败终态各最多保留的归档条数，超出删除最旧的
+MAX_ARCHIVED_PER_OUTCOME = 10
+
+
+def run_outcome(run: dict) -> str | None:
+    """run 的终态分类：'success' / 'failure'；未到达终态返回 None。"""
+    status = run.get("status")
+    if status == "completed":
+        return "success"
+    if status in ("failed", "cancelled", "interrupted"):
+        return "failure"
+    return None
 
 
 class ContextAugmentedLLM:
@@ -173,6 +185,7 @@ class RunManager:
         self._runs: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._load_archived()
+        self._prune_archived()
 
     # --------------------------------------------------------
     # 创建 run
@@ -261,6 +274,29 @@ class RunManager:
                 json.dumps(snap, ensure_ascii=False, default=str))
         except Exception:
             traceback.print_exc()
+        if run_outcome(run) is not None:
+            self._prune_archived()
+
+    def _prune_archived(self):
+        """成功/失败终态各最多保留 MAX_ARCHIVED_PER_OUTCOME 条，
+        超出时删除最旧的（内存 + 磁盘归档）；进行中的 run 不参与清理。"""
+        groups: dict[str, list[dict]] = {"success": [], "failure": []}
+        drop_ids: list[str] = []
+        with self._lock:
+            for run in self._runs.values():
+                outcome = run_outcome(run)
+                if outcome:
+                    groups[outcome].append(run)
+            for runs in groups.values():
+                runs.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+                drop_ids.extend(r["run_id"] for r in runs[MAX_ARCHIVED_PER_OUTCOME:])
+            for run_id in drop_ids:
+                self._runs.pop(run_id, None)
+        for run_id in drop_ids:
+            try:
+                (DATA_DIR / f"{run_id}.json").unlink(missing_ok=True)
+            except OSError:
+                traceback.print_exc()
 
     def _load_archived(self):
         if not DATA_DIR.exists():

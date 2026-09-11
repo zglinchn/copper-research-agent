@@ -47,7 +47,14 @@
       </div>
 
       <div id="run-history" class="run-history">
-        <div class="field-label">运行历史</div>
+        <div class="history-head">
+          <div class="field-label">运行历史</div>
+          <select id="history-filter" class="history-filter" title="按运行结果筛选">
+            <option value="all">全部</option>
+            <option value="success">仅成功</option>
+            <option value="failure">仅失败</option>
+          </select>
+        </div>
         <div id="history-list" class="history-list"><div class="empty">暂无运行记录</div></div>
       </div>
     </section>

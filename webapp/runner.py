@@ -17,6 +17,7 @@ LLM 双模式：
 
 from __future__ import annotations
 import json
+import hashlib
 import os
 import queue
 import threading
@@ -24,16 +25,19 @@ import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import get_args, get_origin
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command as ResumeCommand
-from langchain_core.messages import SystemMessage
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import AIMessage, SystemMessage
+from pydantic import BaseModel
 
 import research_graph
 import reduction_graph
 from schemas import TARGET_PRODUCTS
 from demo_llm import DemoLLM
-from retrieval import RetrievalAugmentedLLM
+from retrieval import RetrievalAugmentedLLM, coerce_structured
 
 PRODUCT_ICONS = {
     "pv_station": "☀️",
@@ -50,6 +54,7 @@ PIPELINES = {
     "research": [
         ("start", "开始"),
         ("supervisor", "主管调度"),
+        ("country_agent", "国家市场与标准调研"),
         ("dimension_agent", "调研维度规划"),
         ("structure_agent", "结构分解"),
         ("copper_agent", "含铜部位识别"),
@@ -65,6 +70,7 @@ PIPELINES = {
         ("baseline_agent", "基线归一化参数"),
         ("baseline_calc_node", "基线确定性计算"),
         ("reduction_agent", "减量措施调研"),
+        ("country_policy_agent", "国家措施适用性核查"),
         ("critic_agent", "审查质询"),
         ("quant_agent", "情景参数定义"),
         ("calculation_node", "情景路径确定性计算"),
@@ -122,17 +128,61 @@ class WatchdogLLM:
         self.inner = inner
 
     def with_structured_output(self, schema):
-        inner_so = self.inner.with_structured_output(schema)
         outer = self
 
         class _WatchdogSO:
             def invoke(_self, messages):
-                return outer._guarded(inner_so.invoke, messages)
+                return outer._guarded(
+                    lambda _messages: outer._invoke_structured(messages, schema), messages
+                )
 
         return _WatchdogSO()
 
     def invoke(self, messages):
-        return self._guarded(self.inner.invoke, messages)
+        return self._guarded(self._invoke_raw, messages)
+
+    @staticmethod
+    def _schema_instruction(schema) -> str:
+        elem = get_args(schema)[0] if get_origin(schema) is list and get_args(schema) else None
+        schema_type = elem if elem is not None else schema
+        if isinstance(schema_type, type) and issubclass(schema_type, BaseModel):
+            schema_json = schema_type.model_json_schema()
+            if elem is not None:
+                schema_json = {"type": "array", "items": schema_json}
+            return (
+                "【结构化输出格式】你的可见回复必须是且只能是符合以下 JSON Schema 的 JSON，"
+                "不要输出解释文字或 Markdown 代码块：\n" +
+                json.dumps(schema_json, ensure_ascii=False)
+            )
+        return ""
+
+    @staticmethod
+    def _chunk_text(chunk) -> str:
+        message = getattr(chunk, "message", chunk)
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(item.get("text", "")) for item in content
+                if isinstance(item, dict)
+            )
+        tool_chunks = getattr(message, "tool_call_chunks", None) or []
+        return "".join(str(item.get("args") or "") for item in tool_chunks)
+
+    def _invoke_raw(self, messages):
+        """将原始模型调用改为stream，保留完整可见文本后再交给结构化解析。"""
+        if hasattr(self.inner, "stream"):
+            parts = [self._chunk_text(chunk) for chunk in self.inner.stream(messages)]
+            return AIMessage(content="".join(parts))
+        return self.inner.invoke(messages)
+
+    def _invoke_structured(self, messages, schema):
+        instruction = self._schema_instruction(schema)
+        prompt = [*messages, SystemMessage(content=instruction)] if instruction else messages
+        raw = self._invoke_raw(prompt)
+        content = raw.content if isinstance(raw, AIMessage) else raw
+        return coerce_structured(content, schema)
 
     def _guarded(self, fn, messages):
         import concurrent.futures as cf
@@ -151,10 +201,60 @@ class WatchdogLLM:
         raise last
 
 
-def _build_base_llm(product_name: str):
+def _infer_stream_node(messages) -> str:
+    """从当前模型请求的系统提示词识别工作流节点，供实时流日志归档。"""
+    text = "\n".join(
+        m if isinstance(m, str) else str(getattr(m, "content", ""))
+        for m in (messages or [])
+    )
+    markers = (
+        ("country_agent", ("国家市场与标准研究员", "国家市场与标准调研")),
+        ("dimension_agent", ("分类维度分析师", "调研维度规划")),
+        ("structure_agent", ("产品结构分析师", "结构分解")),
+        ("copper_agent", ("铜部件识别专家", "含铜部位识别")),
+        ("country_policy_agent", ("国家措施适用性研究员", "措施适用性")),
+        ("reduction_agent", ("铜减量化技术顾问", "减量措施调研")),
+        ("quant_agent", ("定量分析师", "情景参数定义")),
+        ("critic_agent", ("审查专家", "CriticAgent")),
+        ("supervisor", ("团队主管", "主管调度")),
+    )
+    for node, names in markers:
+        if any(name in text for name in names):
+            return node
+    return "model"
+
+
+class _LiveTokenHandler(BaseCallbackHandler):
+    """接收聊天模型真实返回的可见 token，不生成或改写模型内容。"""
+
+    def __init__(self, emit):
+        self.emit = emit
+        self.node = "model"
+
+    def on_chat_model_start(self, serialized, messages, **kwargs):
+        batch = messages[0] if messages and isinstance(messages[0], (list, tuple)) else messages
+        self.node = _infer_stream_node(batch or [])
+
+    def on_llm_start(self, serialized, prompts, **kwargs):
+        self.node = _infer_stream_node(prompts or [])
+
+    def on_llm_new_token(self, token, *, chunk=None, **kwargs):
+        message = getattr(chunk, "message", chunk)
+        text = RunManager._llm_chunk_text(message) if message is not None else ""
+        if not text:
+            if isinstance(token, str):
+                text = token
+            elif isinstance(token, list):
+                text = "".join(str(x) for x in token)
+        if text:
+            self.emit(self.node, text)
+
+
+def _build_base_llm(product_name: str, token_callback=None):
     api_key = os.environ.get("OPENAI_API_KEY")
     if api_key:
         from langchain_openai import ChatOpenAI
+        handler = _LiveTokenHandler(token_callback) if token_callback else None
         return WatchdogLLM(ChatOpenAI(
             model=os.environ.get("COPPER_MODEL", "gpt-4.1"),
             temperature=0,
@@ -162,6 +262,8 @@ def _build_base_llm(product_name: str):
             base_url=os.environ.get("OPENAI_BASE_URL") or None,
             timeout=300,
             max_retries=2,
+            streaming=True,
+            callbacks=[handler] if handler else None,
         )), "online"
     return DemoLLM(product_name=product_name), "demo"
 
@@ -191,7 +293,7 @@ class RunManager:
     # 创建 run
     # --------------------------------------------------------
     def create_runs(self, product_ids: list[str], region: str, baseline_year: int,
-                    constraints: str) -> list[str]:
+                    constraints: str, custom_product_name: str = "") -> list[str]:
         run_ids = []
         for pid in product_ids:
             product = next((p for p in TARGET_PRODUCTS if p["product_id"] == pid), None)
@@ -205,6 +307,17 @@ class RunManager:
             self._persist(run)
             threading.Thread(target=self._execute, args=(run,), daemon=True).start()
             run_ids.append(run_id)
+        custom_name = custom_product_name.strip()
+        if custom_name:
+            custom_id = "custom_" + hashlib.sha1(custom_name.encode("utf-8")).hexdigest()[:12]
+            run_id = uuid.uuid4().hex[:12]
+            run = self._new_run(run_id, "research", custom_id, custom_name,
+                                region, baseline_year, constraints)
+            with self._lock:
+                self._runs[run_id] = run
+            self._persist(run)
+            threading.Thread(target=self._execute, args=(run,), daemon=True).start()
+            run_ids.append(run_id)
         return run_ids
 
     def create_reduction_run(self, parent_run_id: str, analysis_run_id: str | None) -> str | None:
@@ -213,6 +326,10 @@ class RunManager:
             return None
         result = parent["result"]
         if "classification_dimensions" not in result:  # 必须是图A的调研成果
+            return None
+        if not result.get("geography") or not result.get("country_profile"):
+            return None
+        if (result.get("evidence_assessment") or {}).get("tier") == "insufficient":
             return None
         run_id = uuid.uuid4().hex[:12]
         run = self._new_run(run_id, "reduction", parent["product_id"], parent["product_name"],
@@ -240,6 +357,17 @@ class RunManager:
             "current_node": None,
             "node_counts": {},
             "events": [],
+            "stream_order": [],
+            "partial_result": {
+                "product_id": product_id,
+                "product_name": product_name,
+                "classification_dimensions": [],
+                "functional_subsystems": [],
+                "copper_components": [],
+                "objections": [],
+                "validation_flags": [],
+                "debate_log": [],
+            },
             "review": None,          # 人工审核中断payload摘要
             "review_preview": None,  # 人工审核完整预览（ProductResearchOutput dump）
             "error": None,
@@ -320,6 +448,50 @@ class RunManager:
             runs = sorted(self._runs.values(), key=lambda r: r["created_at"], reverse=True)
         return [self.summary(r) for r in runs]
 
+    def clear_finished_runs(self) -> list[str]:
+        """清理已结束的历史与磁盘快照，保留正在执行及其图A父任务。"""
+        active_statuses = {"queued", "running", "cancelling", "waiting_review"}
+        with self._lock:
+            protected_parents = {
+                run.get("parent_run_id") for run in self._runs.values()
+                if run.get("status") in active_statuses and run.get("parent_run_id")
+            }
+            removed_ids = [
+                run_id for run_id, run in self._runs.items()
+                if run.get("status") not in active_statuses and run_id not in protected_parents
+            ]
+            for run_id in removed_ids:
+                self._runs.pop(run_id, None)
+        for run_id in removed_ids:
+            try:
+                (DATA_DIR / f"{run_id}.json").unlink(missing_ok=True)
+            except OSError:
+                traceback.print_exc()
+        return removed_ids
+
+    def delete_run_group(self, run_id: str) -> tuple[list[str] | None, str | None]:
+        """删除选中案例及其关联图A/图B记录；活动案例不可删除。"""
+        active_statuses = {"queued", "running", "cancelling", "waiting_review"}
+        with self._lock:
+            selected = self._runs.get(run_id)
+            if selected is None:
+                return None, "运行记录不存在或已被删除"
+            root_id = selected.get("parent_run_id") or run_id
+            member_ids = [
+                rid for rid, run in self._runs.items()
+                if rid == root_id or run.get("parent_run_id") == root_id
+            ]
+            if any(self._runs[rid].get("status") in active_statuses for rid in member_ids):
+                return None, "进行中、停止中或待审核的案例不能删除"
+            for rid in member_ids:
+                self._runs.pop(rid, None)
+        for rid in member_ids:
+            try:
+                (DATA_DIR / f"{rid}.json").unlink(missing_ok=True)
+            except OSError:
+                traceback.print_exc()
+        return member_ids, None
+
     def summary(self, run: dict) -> dict:
         keys = ("run_id", "graph_type", "product_id", "product_name", "region",
                 "baseline_year", "status", "current_node", "node_counts", "error",
@@ -349,18 +521,23 @@ class RunManager:
     def _execute(self, run: dict):
         run["started_at"] = datetime.now().isoformat(timespec="seconds")
         try:
-            base_llm, mode = _build_base_llm(run["product_name"])
-            ctx = (f"本次调研统一口径——研究区域：{run['region']}；"
+            def emit_token(node, text):
+                run["_callback_stream_seen"] = True
+                self._append_stream(run, node, text)
+
+            base_llm, mode = _build_base_llm(run["product_name"], emit_token)
+            run["_callback_streaming"] = mode == "online"
+            from regions import resolve_country
+            country = resolve_country(run["region"])
+            if country is None:
+                raise ValueError(f"无法识别国家：{run['region']}；请选择国家注册表中的国家")
+            ctx = (f"本次调研统一口径——研究国家：{country.country_name}"
+                   f"（country_id={country.country_id}，GCAM区域={country.gcam_region_id}）；"
                    f"调研基准年：{run['baseline_year']}；补充约束：{run['constraints'] or '无'}。"
-                   f"请在产出中遵循该口径。")
+                   f"国家事实必须提供evidence_country、evidence_year和statistic_caliber。")
             # 在线模式且配置了TAVILY_API_KEY时，使用检索增强层（内含统一口径
             # 注入 + 各专业agent区域化检索前置 + 端点兼容性处理）；否则仅注入口径
-            _region = None
-            try:
-                from regions import normalize_region as _norm
-                _region = _norm(run["region"])
-            except Exception:
-                _region = None
+            _region = country
             if mode == "online" and os.environ.get("TAVILY_API_KEY"):
                 llm = RetrievalAugmentedLLM(base_llm, product_name=run["product_name"],
                                              context_text=ctx, region=_region)
@@ -372,8 +549,13 @@ class RunManager:
                 init_state = {
                     "product_id": run["product_id"],
                     "product_name": run["product_name"],
-                    "region_id": run["region"],
-                    "region_name": run["region"],
+                    "region_id": country.gcam_region_id,
+                    "region_name": country.country_name,
+                    "geography": {"geography_level": "country",
+                                  "country_id": country.country_id,
+                                  "country_name": country.country_name,
+                                  "gcam_region_id": country.gcam_region_id},
+                    "country_profile": None, "country_retry_count": 0,
                     "stage": "dimension_structure_debate",
                     "dimension_proposal": [], "dimension_version": 0,
                     "structure_proposal": [], "structure_version": 0,
@@ -391,8 +573,10 @@ class RunManager:
                 graph = reduction_graph.build_reduction_graph(llm, checkpointer=MemorySaver())
                 init_state = {
                     "product_id": run["product_id"],
-                    "region_id": run["region"],
-                    "region_name": run["region"],
+                    "region_id": (run["research_output"].get("geography") or {}).get(
+                        "gcam_region_id", country.gcam_region_id),
+                    "region_name": (run["research_output"].get("geography") or {}).get(
+                        "country_name", country.country_name),
                     "evidence_policy": (run.get("research_output") or {}).get(
                         "evidence_assessment", {}).get("evidence_policy", "region_specific")
                         if isinstance(run.get("research_output"), dict) else "region_specific",
@@ -402,7 +586,8 @@ class RunManager:
                     "stage": "baseline_quantification",
                     "baseline_params": None, "model_baselines": [],
                     "baseline_calc_method": "",
-                    "reduction_measures": [], "scenario_params": [],
+                    "reduction_measures": [], "country_measure_review": None,
+                    "scenario_params": [],
                     "scenarios": [], "trajectory": [],
                     "functional_unit_candidates": [], "chosen_functional_unit": "",
                     "baseline_unit_intensity": None,
@@ -425,8 +610,8 @@ class RunManager:
                         self._add_event(run, "done", "已停止", "用户手动停止了本次运行")
                         self._persist(run)
                         return
-                    if mode == "messages":
-                        # LLM token增量：按节点缓存，供前端点击节点查看实时思考过程
+                    if mode == "messages" and not run.get("_callback_streaming"):
+                        # 兼容没有callback能力的模型；在线模型由真实token回调负责，避免重复追加
                         msg, meta = chunk
                         node = str((meta or {}).get("langgraph_node") or "?")
                         text = self._llm_chunk_text(msg)
@@ -506,9 +691,12 @@ class RunManager:
     def _append_stream(self, run: dict, node: str, text: str):
         """全量累积token增量（不人为截断，数据完整性优先）；
         可视区域的滚动丢弃由前端overflow滚动自然完成。
-        同时把增量推给所有SSE订阅者（逐字打字机观感）。"""
+        同时把增量推给所有SSE订阅者，保持模型原始输出顺序。"""
         buf = run.setdefault("stream_buf", {})
         buf[node] = (buf.get(node) or "") + text
+        order = run.setdefault("stream_order", [])
+        if node not in order:
+            order.append(node)
         run["stream_current"] = node
         for q in list(run.get("_subscribers") or []):
             try:
@@ -547,6 +735,37 @@ class RunManager:
         if update.get("total_round") is not None:
             run["total_round"] = update["total_round"]
 
+        # 将图节点已经产出的结构化字段持续汇总，供“调研成果”在运行中实时预览。
+        partial = run.setdefault("partial_result", {
+            "product_id": run["product_id"], "product_name": run["product_name"],
+            "classification_dimensions": [], "functional_subsystems": [],
+            "copper_components": [], "objections": [], "validation_flags": [],
+            "debate_log": [],
+        })
+        field_map = {
+            "dimension_proposal": "classification_dimensions",
+            "structure_proposal": "functional_subsystems",
+            "copper_components": "copper_components",
+            "country_profile": "country_profile",
+            "geography": "geography",
+            "evidence_assessment": "evidence_assessment",
+            "validation_flags": "validation_flags",
+            "objections": "objections",
+            "debate_log": "debate_log",
+            "baseline_params": "baseline_params",
+            "model_baselines": "model_baselines",
+            "reduction_measures": "reduction_measures",
+            "country_measure_review": "country_measure_review",
+            "scenario_params": "scenario_params",
+            "scenarios": "scenarios",
+            "trajectory": "trajectory",
+            "chosen_functional_unit": "chosen_functional_unit",
+            "baseline_unit_intensity": "baseline_unit_intensity",
+        }
+        for source, target in field_map.items():
+            if source in update and update[source] is not None:
+                partial[target] = update[source]
+
         labels = dict(PIPELINES[run["graph_type"]])
         self._add_event(run, node, labels.get(node, node), summary or "节点执行完成")
 
@@ -583,9 +802,11 @@ class RunManager:
         d["total_round"] = run.get("total_round")
         d["events"] = run["events"][-120:]
         d["review"] = run.get("review")
-        # LLM流式输出（按节点缓存的token累积文本），供前端实时展示思考过程
+        # LLM流式输出（按节点缓存的token累积文本），供前端实时展示可见模型输出
         d["stream_buf"] = run.get("stream_buf") or {}
         d["stream_current"] = run.get("stream_current")
+        d["stream_order"] = run.get("stream_order") or []
+        d["partial_result"] = run.get("partial_result") or {}
         # 待审核时附完整预览内容（审核卡片内直接展示，而不是只给统计数字）
         if run["status"] == "waiting_review":
             d["review_preview"] = run.get("review_preview")

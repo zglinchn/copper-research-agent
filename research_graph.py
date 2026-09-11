@@ -47,15 +47,16 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from schemas import (
     ClassificationDimension, FunctionalSubsystem, CopperComponent,
     Objection, CriticReview, DebateLogEntry, SupervisorDecision, AgentRole,
-    ProductResearchOutput, heuristic_axis_consistency_scan, upsert_objections,
+    ProductResearchOutput, CountryResearchProfile, heuristic_axis_consistency_scan,
+    upsert_objections,
 )
 
 MAX_ROUNDS_PER_STAGE = 3
 MAX_TOTAL_ROUNDS = 12
 
 RESEARCH_STAGE_AGENTS: dict[str, set[AgentRole]] = {
-    "dimension_structure_debate": {"dimension_agent", "structure_agent", "critic_agent"},
-    "copper_identification": {"copper_agent", "critic_agent"},
+    "dimension_structure_debate": {"country_agent", "dimension_agent", "structure_agent", "critic_agent"},
+    "copper_identification": {"country_agent", "copper_agent", "critic_agent"},
     "human_review": set(),  # 无agent，等待人工
     "done": set(),
 }
@@ -70,6 +71,9 @@ class ResearchState(TypedDict):
     product_name: str
     region_id: str
     region_name: str
+    geography: dict
+    country_profile: Optional[dict]
+    country_retry_count: int
 
     stage: Literal["dimension_structure_debate", "copper_identification",
                    "human_review", "done"]
@@ -100,6 +104,68 @@ class ResearchState(TypedDict):
 
     research_version: int
     final_output: Optional[dict]
+
+
+# ============================================================
+# Agent 0: CountryAgent
+# ============================================================
+
+COUNTRY_AGENT_PERSONA = """\
+你是「国家市场与标准研究员」。研究对象是 {country_name} 的 {product_name}，
+country_id 必须原样填写为 {country_id}。
+查明会改变型号结构、含铜部位、铜/铝材料采用率和减量措施可行性的国家事实，
+包括国家标准、能效法规、采购规则、市场份额和本国工程惯例。
+
+必须区分国家事实、GCAM区域事实和全球事实。每个 evidence_item 必须填写来源
+实际覆盖国家、证据年份、统计口径和可核验URL；全球或跨国数据不得写成该国份额。
+target_id 优先使用以下现有 value_id 或 component_id，使证据能进入实体和计算：
+{targets}
+
+待修订意见：
+{objection_context}
+"""
+
+
+def country_agent(state: ResearchState, llm) -> Command:
+    my_objections = [o for o in state["objections"]
+                     if o["target_agent"] == "country_agent" and not o.get("addressed")]
+    targets = [v.get("value_id") for d in state.get("dimension_proposal") or []
+               for v in d.get("values") or []]
+    targets += [c.get("component_id") for c in state.get("copper_components") or []]
+    messages = [SystemMessage(content=COUNTRY_AGENT_PERSONA.format(
+        country_name=state["geography"]["country_name"], product_name=state["product_name"],
+        country_id=state["geography"]["country_id"],
+        targets=targets or "尚无实体；先形成国家市场、标准和材料惯例证据",
+        objection_context="\n".join(f"- {o['detail']}" for o in my_objections) or "无",
+    ))]
+    profile = llm.with_structured_output(CountryResearchProfile).invoke(messages)
+
+    dimensions = state.get("dimension_proposal") or []
+    components = state.get("copper_components") or []
+    for item in profile.evidence_items:
+        cites = [c.model_dump() for c in item.citations]
+        for dim in dimensions:
+            for value in dim.get("values") or []:
+                if item.target_type == "dimension_value" and value.get("value_id") == item.target_id:
+                    value["citations"] = [*(value.get("citations") or []), *cites]
+        for component in components:
+            if item.target_type == "copper_component" and component.get("component_id") == item.target_id:
+                component["citations"] = [*(component.get("citations") or []), *cites]
+
+    retrying_region_gate = any(o["objection_id"].startswith("country-evidence-")
+                               for o in my_objections)
+    return Command(goto="region_evidence_gate" if retrying_region_gate else "supervisor", update={
+        "country_profile": profile.model_dump(),
+        "dimension_proposal": dimensions, "copper_components": components,
+        "country_retry_count": state.get("country_retry_count", 0) + 1,
+        "objections": [{**o, "addressed": True,
+                         "response_note": "country_agent已补充国家级证据"} for o in my_objections],
+        "debate_log": [DebateLogEntry(
+            round=state["total_round"], speaker="country_agent", message_type="proposal",
+            summary=f"形成{profile.country_id}国家画像并补充{len(profile.evidence_items)}项证据",
+        ).model_dump()],
+        "total_round": state["total_round"] + 1,
+    })
 
 
 # ============================================================
@@ -314,6 +380,9 @@ response_note是否真的解决了问题：
 当前含铜部位调研（若尚未进行到该阶段则为空）：
 {copper_components}
 
+国家市场与标准研究结果：
+{country_profile}
+
 请输出你的完整判断（CriticReview结构）：new_objections装本轮新发现的问题，
 reopened_objection_ids/reopen_reasoning装复核历史objection后需要重新打开的部分。
 """
@@ -348,6 +417,7 @@ def critic_agent(state: ResearchState, llm) -> Command:
             dimension_proposal=state["dimension_proposal"],
             structure_proposal=state["structure_proposal"],
             copper_components=state["copper_components"],
+            country_profile=state.get("country_profile") or "(尚未产出)",
         )),
     ]
     structured_llm = llm.with_structured_output(CriticReview)
@@ -531,6 +601,14 @@ def supervisor(state: ResearchState, llm) -> Command:
             ).model_dump()],
         })
 
+    if not state.get("country_profile"):
+        return Command(goto="country_agent", update={
+            "debate_log": [DebateLogEntry(
+                round=state["total_round"], speaker="supervisor",
+                message_type="routing_decision", summary="先建立国家市场与标准画像",
+            ).model_dump()],
+        })
+
     if state["stage"] == "done":
         return _to_review()
 
@@ -585,6 +663,8 @@ def _fallback_rule_based_decision(state: ResearchState, blocking: list[dict]) ->
         # P0(dimension_value_axis_mismatch)已在传入前排到最前
         return SupervisorDecision(next_agent=blocking[0]["target_agent"],
                                    reasoning="规则兜底：优先处理最高优先级blocking objection")
+    if not state.get("country_profile"):
+        return SupervisorDecision(next_agent="country_agent", reasoning="规则兜底：国家画像尚未产出")
     if not state["dimension_proposal"]:
         return SupervisorDecision(next_agent="dimension_agent", reasoning="规则兜底：维度提案尚未产出")
     if not state["structure_proposal"]:
@@ -624,6 +704,8 @@ def human_review_gate(state: ResearchState) -> Command:
         product_name=state["product_name"],
         region_id=state.get("region_id") or "unknown",
         region_name=state.get("region_name") or "unknown",
+        geography=state.get("geography"),
+        country_profile=state.get("country_profile"),
         research_version=state["research_version"],
         research_status="pending_human_review",
         classification_dimensions=state["dimension_proposal"],
@@ -650,6 +732,12 @@ def human_review_gate(state: ResearchState) -> Command:
     })
 
     if decision.get("approved"):
+        unresolved = [o for o in state["objections"]
+                      if o["severity"] == "blocking" and not o.get("addressed")]
+        blocking_flags = [f for f in state.get("validation_flags") or []
+                          if f.get("severity") == "blocking" and not f.get("resolved")]
+        if unresolved or blocking_flags or (state.get("evidence_assessment") or {}).get("tier") == "insufficient":
+            raise ValueError("国家级调研成果不可批准：仍有未解决阻断项或国家证据不足")
         output.research_status = "approved"
         output.approved_by = decision.get("approved_by")
         output.approved_at = decision.get("approved_at")
@@ -719,7 +807,11 @@ from schemas import ValidationFlag  # noqa: E402
 
 
 def region_evidence_gate(state: ResearchState) -> Command:
-    region = normalize_region(state.get("region_id"))
+    from regions import resolve_country
+    geography = state.get("geography") or {}
+    region = resolve_country(geography.get("country_id"))
+    if region is None:  # 历史状态/节点级测试兼容；新运行始终走国家对象
+        region = normalize_region(state.get("region_id"))
     citations: list[dict] = []
     for d in state.get("dimension_proposal") or []:
         citations.extend(d.get("evidence") or [])
@@ -729,6 +821,8 @@ def region_evidence_gate(state: ResearchState) -> Command:
         citations.extend(s.get("evidence") or [])
     for c in state.get("copper_components") or []:
         citations.extend(c.get("citations") or [])
+    for item in (state.get("country_profile") or {}).get("evidence_items") or []:
+        citations.extend(item.get("citations") or [])
 
     # s5 覆盖度：优先用 critic 顺带给出的评分，否则程序化兜底
     # （叶子子系统被含铜部位覆盖的比例）
@@ -746,16 +840,26 @@ def region_evidence_gate(state: ResearchState) -> Command:
         coverage = covered / len(leaves) * 100.0 if leaves else 50.0
     
     assessment = compute_region_assessment(citations, region, coverage_score=coverage)
-    dims, comps = apply_region_fallback_marking(
+    entity_gaps = find_region_unsupported(
         state.get("dimension_proposal") or [],
-        state.get("copper_components") or [],
-        region, assessment.evidence_policy,
-    )
+        state.get("copper_components") or [], region)
+    needs_supplement = ((assessment.tier == "insufficient" or bool(entity_gaps)) and
+                        state.get("country_retry_count", 0) < 2)
+    # 补查前不改写、不清空任何区域参数；只有补查结束仍不足时才落全球兜底标记。
+    if needs_supplement:
+        dims = state.get("dimension_proposal") or []
+        comps = state.get("copper_components") or []
+    else:
+        dims, comps = apply_region_fallback_marking(
+            state.get("dimension_proposal") or [],
+            state.get("copper_components") or [],
+            region, assessment.evidence_policy,
+        )
     
     # region_specific 声明必须有区域命中引用（确定性审计）：
     # sufficient 口径下未被兜底标注却无区域命中的实体，生成
     # region_basis_unsupported 校验标记供人工审核重点核查。
-    unsupported = find_region_unsupported(dims, comps, region)
+    unsupported = [] if needs_supplement else find_region_unsupported(dims, comps, region)
     audit_flags = []
     if unsupported:
         audit_flags.append(ValidationFlag(
@@ -763,8 +867,9 @@ def region_evidence_gate(state: ResearchState) -> Command:
             description="以下实体声称 region_specific 但引用中无任何区域命中，"
                         "请在审核时补充区域证据或确认采用全球主流口径："
                         + "；".join(unsupported),
-            related_ids=[region.region_id] if region else [],
-            severity="warning",  # gate 确定性审计项，不阻断人工审核
+            related_ids=[region.country_id if hasattr(region, "country_id") else region.region_id]
+                        if region else [],
+            severity="blocking",
         ).model_dump())
 
     log_entry = DebateLogEntry(
@@ -776,7 +881,7 @@ def region_evidence_gate(state: ResearchState) -> Command:
                 f"{assessment.summary_note}",
     )
     return Command(
-        goto="human_review_gate",
+        goto="country_agent" if needs_supplement else "human_review_gate",
         update={
             "dimension_proposal": dims,
             "copper_components": comps,
@@ -784,8 +889,19 @@ def region_evidence_gate(state: ResearchState) -> Command:
             "evidence_policy": assessment.evidence_policy,
             "evidence_gate_done": True,
             "stage": "human_review",
-            "validation_flags": (state.get("validation_flags") or []) + audit_flags,
+            "validation_flags": [
+                f for f in (state.get("validation_flags") or [])
+                if f.get("flag_type") != "region_basis_unsupported"
+            ] + audit_flags,
             "debate_log": [log_entry.model_dump()],
+            **({"objections": [Objection(
+                objection_id=f"country-evidence-{state.get('country_retry_count', 0)}",
+                raised_by="critic_agent", target_agent="country_agent",
+                flag_type="region_basis_unsupported",
+                detail="国家证据不足，请针对缺少国家命中的型号取值和含铜部件补充国家级来源："
+                       + "；".join(entity_gaps),
+                severity="blocking", round_raised=state["total_round"],
+            ).model_dump()]} if needs_supplement else {}),
         },
     )
 
@@ -798,6 +914,7 @@ def build_research_graph(llm, checkpointer=None):
     g = StateGraph(ResearchState)
 
     g.add_node("supervisor", lambda s: supervisor(s, llm))
+    g.add_node("country_agent", lambda s: country_agent(s, llm))
     g.add_node("dimension_agent", lambda s: dimension_agent(s, llm))
     g.add_node("structure_agent", lambda s: structure_agent(s, llm))
     g.add_node("critic_agent", lambda s: critic_agent(s, llm))
@@ -832,6 +949,10 @@ if __name__ == "__main__":
 
     init_state: ResearchState = {
         "product_id": "pv_station", "product_name": "光伏电站",
+        "region_id": "China", "region_name": "中国",
+        "geography": {"geography_level": "country", "country_id": "China",
+                      "country_name": "中国", "gcam_region_id": "China"},
+        "country_profile": None, "country_retry_count": 0,
         "stage": "dimension_structure_debate",
         "dimension_proposal": [], "dimension_version": 0,
         "structure_proposal": [], "structure_version": 0,

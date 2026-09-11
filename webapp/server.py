@@ -17,7 +17,10 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import sys
+import threading
+import time
 
 # 保证以 `python3 webapp/server.py` 或 uvicorn 任意cwd启动时都能找到模块：
 # 根目录(schemas/research_graph等) 与 webapp目录(runner/export_excel等)
@@ -63,10 +66,13 @@ manager = RunManager()
 
 @app.get("/api/regions")
 def list_regions():
-    """GCAM 区域注册表（前端区域 datalist/下拉）"""
+    """国家注册表；同时返回所属GCAM区域。"""
     try:
-        from regions import region_options
-        return {"regions": region_options()}
+        from regions import country_options
+        countries = country_options()
+        return {"countries": countries, "regions": [
+            {"region_id": c["gcam_region_id"], "name_cn": c["country_name"],
+             "country_id": c["country_id"], "members": []} for c in countries]}
     except Exception as exc:
         raise HTTPException(500, f"区域注册表加载失败: {exc}")
 
@@ -95,7 +101,8 @@ def get_meta():
 # ============================================================
 
 class RunRequest(BaseModel):
-    product_ids: list[str]
+    product_ids: list[str] = []
+    custom_product_name: str = ""
     region: str = "中国"
     baseline_year: int = 2025
     constraints: str = ""
@@ -103,11 +110,18 @@ class RunRequest(BaseModel):
 
 @app.post("/api/runs")
 def create_runs(req: RunRequest):
-    if not req.product_ids:
-        raise HTTPException(400, "product_ids不能为空")
+    custom_product_name = req.custom_product_name.strip()
+    if not req.product_ids and not custom_product_name:
+        raise HTTPException(400, "至少选择一个产品或填写额外产品")
+    if len(custom_product_name) > 80:
+        raise HTTPException(400, "额外产品名称不能超过80个字符")
+    from regions import resolve_country
+    if resolve_country(req.region.strip() or "中国") is None:
+        raise HTTPException(400, "研究区域必须是国家注册表中的明确国家，不能填写GCAM聚合区域或自由文本")
     run_ids = manager.create_runs(
         product_ids=req.product_ids, region=req.region.strip() or "中国",
         baseline_year=int(req.baseline_year), constraints=req.constraints.strip(),
+        custom_product_name=custom_product_name,
     )
     if not run_ids:
         raise HTTPException(400, "未创建任何运行：product_id无效")
@@ -119,12 +133,67 @@ def list_runs():
     return {"runs": manager.list_runs()}
 
 
+@app.get("/api/results")
+def list_results():
+    """成果页专用数据：只返回成功完成的减量化全流程结果。"""
+    output_runs = []
+    for summary in manager.list_runs():
+        # 成果中心只收录图B成功完成的记录；运行历史仍保留失败、停止和运行中记录。
+        if summary.get("status") != "completed" or summary.get("graph_type") != "reduction":
+            continue
+        run = manager.get(summary["run_id"])
+        if not run or not isinstance(run.get("result"), dict) or not run.get("result"):
+            continue
+        result = run["result"]
+        research = (
+            result if "classification_dimensions" in result
+            else run.get("research_output") or {}
+        )
+        output_runs.append({
+            **summary,
+            "result": result,
+            "research_output": research,
+        })
+    return {"runs": output_runs}
+
+
+@app.delete("/api/runs/history")
+def clear_run_history():
+    removed_ids = manager.clear_finished_runs()
+    return {"removed_count": len(removed_ids), "removed_ids": removed_ids}
+
+
+@app.delete("/api/run-groups/{run_id}")
+def delete_run_group(run_id: str):
+    removed_ids, error = manager.delete_run_group(run_id)
+    if error:
+        raise HTTPException(409, error)
+    return {"removed_count": len(removed_ids or []), "removed_ids": removed_ids or []}
+
+
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: str):
     run = manager.get(run_id)
     if run is None:
         raise HTTPException(404, "运行不存在")
     return manager.detail(run)
+
+
+@app.get("/results")
+def results_page():
+    """独立成果展示页；不改变原有运行详情页。"""
+    return FileResponse(os.path.join(STATIC_DIR, "results.html"))
+
+
+@app.post("/api/shutdown")
+def shutdown_service():
+    """停止当前本地 Uvicorn 服务，由网页停止按钮调用。"""
+    def stop_process():
+        time.sleep(0.2)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=stop_process, daemon=True).start()
+    return {"ok": True, "message": "后台服务将在短暂延迟后停止"}
 
 
 # ============================================================
@@ -226,7 +295,11 @@ def stream_events(run_id: str):
         try:
             # 先推一次当前已有缓冲（前端直接填充，不回放打字机）
             run = manager.get(run_id)
-            init = {"type": "init", "buf": (run or {}).get("stream_buf") or {}}
+            init = {
+                "type": "init",
+                "buf": (run or {}).get("stream_buf") or {},
+                "order": (run or {}).get("stream_order") or [],
+            }
             yield f"data: {json.dumps(init, ensure_ascii=False)}\n\n"
             while True:
                 run = manager.get(run_id)

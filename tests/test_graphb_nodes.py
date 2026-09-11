@@ -175,6 +175,20 @@ def test_integration_requires_computed_outputs():
     assert out["baseline_unit_intensity"]["value"] == pytest.approx(5.0)
     assert out["region_id"] == "China"
 
+    blocked = dict(st)
+    blocked["objections"] = [{"objection_id": "x", "raised_by": "critic_agent",
+                              "target_agent": "reduction_agent", "flag_type": "other",
+                              "detail": "未解决", "severity": "blocking",
+                              "round_raised": 1, "addressed": False}]
+    with pytest.raises(ValueError, match="blocking objection"):
+        rg.integration_node(blocked)
+
+    fallback = dict(st)
+    fallback["scenarios"] = [dict(s, scenario_rationale="轮次耗尽系统兜底")
+                             for s in st["scenarios"]]
+    with pytest.raises(ValueError, match="程序兜底"):
+        rg.integration_node(fallback)
+
 
 class _StubLLM:
     """supervisor 路由测试用：返回固定决策"""

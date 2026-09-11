@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>铜产品减量化模型 · 成果中心</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/results.css">
+</head>
+<body class="results-page">
+<main class="results-app" id="results-app">
+  <header class="results-header">
+    <div class="results-breadcrumb"><a href="/">运行任务</a><span>/</span><b>成果中心</b><span>/</span><b>通用输出模板</b></div>
+    <div class="results-title-row">
+      <div>
+        <h1>铜产品减量化模型</h1>
+        <p>按产品与研究区域查看标准化输出。</p>
+      </div>
+      <div class="results-source-note">数据来自成功完成的减量化全流程</div>
+    </div>
+  </header>
+
+  <form class="results-filters" id="results-filters">
+    <label>产品名称<select id="filter-product"><option value="all">全部产品</option></select></label>
+    <label>研究区域<select id="filter-region"><option value="all">全部区域</option></select></label>
+    <label class="record-filter">成果记录<select id="filter-run"><option value="all">全部成功记录</option></select></label>
+    <label>情景时间范围<div class="year-range"><input id="filter-start" type="number" min="2000" max="2100" value="2025"><span>—</span><input id="filter-end" type="number" min="2000" max="2100" value="2035"></div></label>
+    <button class="btn primary" type="submit">应用筛选</button>
+  </form>
+
+  <nav class="template-tabs" id="template-tabs" aria-label="通用输出模板子表"></nav>
+  <section class="template-view" id="template-view" aria-live="polite"></section>
+</main>
+<script src="/static/results.js"></script>
+</body>
+</html>

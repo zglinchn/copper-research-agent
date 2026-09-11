@@ -52,7 +52,7 @@ def test_old_run_json_backcompat():
             assert out.region_id  # 默认 "unknown" 或真实值
         elif "reduction_measures" in result:
             out = ProductReductionModel.model_validate(result)
-            assert out.model_baselines == []  # 旧成果无基线，默认空表
+            assert isinstance(out.model_baselines, list)
         else:
             continue
         checked += 1

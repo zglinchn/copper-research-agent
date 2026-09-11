@@ -61,15 +61,15 @@ from schemas import (
     BaselineParams, CalculationParams, CopperReductionMeasure, Objection,
     CriticReview, DebateLogEntry, SupervisorDecision, AgentRole,
     ProductResearchOutput, ProductReductionModel, AmendmentRequest,
-    ScenarioParams, SCENARIO_SEVERITY_ORDER, upsert_objections,
+    ScenarioParams, CountryMeasureReview, SCENARIO_SEVERITY_ORDER, upsert_objections,
 )
 
 MAX_ROUNDS_PER_STAGE = 3
-MAX_TOTAL_ROUNDS = 10
+MAX_TOTAL_ROUNDS = 14
 
 REDUCTION_STAGE_AGENTS: dict[str, set[AgentRole]] = {
     "baseline_quantification": {"baseline_agent", "critic_agent"},
-    "reduction_research": {"reduction_agent", "critic_agent"},
+    "reduction_research": {"reduction_agent", "country_policy_agent", "critic_agent"},
     "quantification": {"quant_agent", "critic_agent"},
     "done": set(),
 }
@@ -93,6 +93,7 @@ class ReductionState(TypedDict):
     baseline_calc_method: str
 
     reduction_measures: list[dict]
+    country_measure_review: Optional[dict]
     scenario_params: list[dict]
     scenarios: list[dict]
     trajectory: list[dict]
@@ -209,6 +210,10 @@ def load_research_output(state: ReductionState) -> Command:
             f"研究成果 v{research.research_version} 状态为「{research.research_status}」，"
             f"未经批准不允许进入减量化分析阶段。"
         )
+    if research.geography is None or research.country_profile is None:
+        raise ValueError("调研成果缺少严格国家范围或国家研究画像，不能进入国家级减量化分析")
+    if research.evidence_assessment and research.evidence_assessment.tier == "insufficient":
+        raise ValueError("调研成果的国家证据等级为insufficient，不能进入减量化分析")
     # 区域与证据口径以调研成果为权威源（runner 预填值仅作兜底）
     region_id = research.region_id if research.region_id != "unknown" \
         else (state.get("region_id") or "unknown")
@@ -481,7 +486,11 @@ def reduction_agent(state: ReductionState, llm) -> Command:
     # 措施数不足以构造 S1<S2<S3 严格递增情景。
     prev_measures = {m["measure_id"]: m for m in state.get("reduction_measures") or []}
     new_measures = {m.measure_id: m.model_dump() for m in output.measures}
-    restored = [mid for mid in prev_measures if mid not in new_measures]
+    disallowed = {a["measure_id"] for a in
+                  (state.get("country_measure_review") or {}).get("assessments", [])
+                  if not a.get("applicable_in_country")}
+    restored = [mid for mid in prev_measures
+                if mid not in new_measures and mid not in disallowed]
     merged_measures = list(new_measures.values()) + \
         [prev_measures[mid] for mid in restored]
 
@@ -515,12 +524,66 @@ def reduction_agent(state: ReductionState, llm) -> Command:
         goto="supervisor",
         update={
             "reduction_measures": merged_measures,
+            "country_measure_review": None,
             "amendment_requests": [a.model_dump() for a in amendment_requests],
             "objections": updated_objections,
             "debate_log": [log_entry.model_dump()],
             "total_round": state["total_round"] + 1,
         },
     )
+
+
+# ============================================================
+# Agent：CountryPolicyAgent —— 国家措施适用性核查
+# ============================================================
+
+COUNTRY_POLICY_AGENT_PERSONA = """\
+你是「国家措施适用性研究员」。逐条核查以下铜减量措施在 {country_name}
+是否已有应用、试点、限制或禁止条件。country_id 必须填写 {country_id}。
+不得用全球案例证明本国可实施；每条措施必须附目标国家来源，并填写证据年份、
+统计口径和URL。若证据无法证明适用，applicable_in_country=false。
+
+待核查措施：
+{measures}
+"""
+
+
+def country_policy_agent(state: ReductionState, llm) -> Command:
+    geography = state["research_output"]["geography"]
+    review = llm.with_structured_output(CountryMeasureReview).invoke([
+        SystemMessage(content=COUNTRY_POLICY_AGENT_PERSONA.format(
+            country_name=geography["country_name"], country_id=geography["country_id"],
+            measures=state["reduction_measures"],
+        ))
+    ])
+    known = {m["measure_id"] for m in state["reduction_measures"]}
+    assessed = {a.measure_id for a in review.assessments}
+    if assessed != known:
+        raise ValueError(f"国家措施核查未逐条覆盖全部措施：缺少{sorted(known-assessed)}，"
+                         f"多出{sorted(assessed-known)}")
+    objections = []
+    for a in review.assessments:
+        if not a.applicable_in_country:
+            objections.append(_system_objection(
+                state, "reduction_agent", "insufficient_evidence_quality",
+                f"措施{a.measure_id}缺少目标国家适用性：{a.national_constraints}"))
+        else:
+            measure = next(m for m in state["reduction_measures"]
+                           if m["measure_id"] == a.measure_id)
+            measure["additional_citations"] = [
+                *(measure.get("additional_citations") or []),
+                *[c.model_dump() for c in a.citations],
+            ]
+    return Command(goto="supervisor", update={
+        "country_measure_review": review.model_dump(),
+        "objections": [o.model_dump() for o in objections],
+        "debate_log": [DebateLogEntry(
+            round=state["total_round"], speaker="country_policy_agent",
+            message_type="objection" if objections else "approval",
+            summary=f"完成{len(review.assessments)}条措施的国家适用性核查",
+        ).model_dump()],
+        "total_round": state["total_round"] + 1,
+    })
 
 
 # ============================================================
@@ -1007,6 +1070,18 @@ def supervisor(state: ReductionState, llm) -> Command:
     if state["stage"] == "done":
         return Command(goto="integration")
 
+    if (state["stage"] == "reduction_research" and state.get("reduction_measures")
+            and not state.get("country_measure_review") and not blocking_sorted):
+        return Command(goto="country_policy_agent", update={
+            "debate_log": [DebateLogEntry(
+                round=state["total_round"], speaker="supervisor",
+                message_type="routing_decision", summary="派遣国家措施适用性核查",
+            ).model_dump()],
+        })
+    if (state["stage"] == "reduction_research" and state.get("country_measure_review")
+            and state["round_in_stage"] < 1 and not blocking_sorted):
+        return Command(goto="critic_agent")
+
     # 代码强制路由：critic已审查且无blocking时，确定性计算节点自动执行，
     # 不经过LLM决策（LLM的next_agent枚举里也没有代码节点）。
     if state["stage"] == "baseline_quantification" and state.get("baseline_params") \
@@ -1099,6 +1174,8 @@ def _fallback_rule_based_decision(state: ReductionState, blocking: list[dict]) -
     if state["stage"] == "reduction_research":
         if not state["reduction_measures"]:
             return SupervisorDecision(next_agent="reduction_agent", reasoning="规则兜底：措施尚未产出")
+        if not state.get("country_measure_review"):
+            return SupervisorDecision(next_agent="country_policy_agent", reasoning="规则兜底：国家适用性尚未核查")
         return SupervisorDecision(next_agent="critic_agent", reasoning="规则兜底：默认交由critic审查措施")
     # quantification
     if not state.get("scenario_params"):
@@ -1113,11 +1190,39 @@ def integration_node(state: ReductionState):
     if not state.get("scenarios") or not state.get("trajectory"):
         raise ValueError("integration缺少scenarios/trajectory：calculation_node未成功执行，"
                          "不允许落final_output")
+    assessment = state["research_output"].get("evidence_assessment") or {}
+    if assessment.get("tier") == "insufficient":
+        raise ValueError("国家证据等级为insufficient，不能生成国家级铜减量化模型")
+    unresolved = [o for o in state.get("objections") or []
+                  if o.get("severity") == "blocking" and not o.get("addressed")]
+    if unresolved:
+        raise ValueError(f"仍有{len(unresolved)}条未解决blocking objection，不能标记完成")
+    if any("轮次耗尽系统兜底" in (s.get("scenario_rationale") or "")
+           for s in state.get("scenarios") or []):
+        raise ValueError("情景为轮次耗尽后的程序兜底，不属于可验收研究成果")
+    if state["research_output"].get("geography") and not state.get("country_measure_review"):
+        raise ValueError("缺少国家措施适用性核查，不能标记完成")
+    geography = state["research_output"].get("geography")
+    if geography:
+        from regions import resolve_country
+        from evidence_scoring import citation_region_hit
+        country = resolve_country(geography.get("country_id"))
+        missing_scenario_evidence = [
+            s.get("scenario_id") for s in state.get("scenarios") or []
+            if s.get("scenario_id") != "S0" and not any(
+                citation_region_hit(c, country) for c in s.get("citations") or [])
+        ]
+        if missing_scenario_evidence:
+            raise ValueError("以下情景缺少目标国家证据，不能标记完成："
+                             + ", ".join(missing_scenario_evidence))
     bp = BaselineParams.model_validate(state["baseline_params"]) if state.get("baseline_params") else None
     model = ProductReductionModel(
         product_id=state["product_id"],
         region_id=state.get("region_id") or "unknown",
         region_name=state.get("region_name") or "unknown",
+        geography=state["research_output"].get("geography"),
+        country_profile=state["research_output"].get("country_profile"),
+        country_measure_review=state.get("country_measure_review"),
         based_on_research_version=state["research_output"]["research_version"],
         analysis_run_id=state["analysis_run_id"],
         functional_unit_candidates=state.get("functional_unit_candidates") or
@@ -1154,6 +1259,7 @@ def build_reduction_graph(llm, checkpointer=None):
     g.add_node("baseline_agent", lambda s: baseline_agent(s, llm))
     g.add_node("baseline_calc_node", baseline_calc_node)
     g.add_node("reduction_agent", lambda s: reduction_agent(s, llm))
+    g.add_node("country_policy_agent", lambda s: country_policy_agent(s, llm))
     g.add_node("critic_agent", lambda s: critic_agent(s, llm))
     g.add_node("quant_agent", lambda s: quant_agent(s, llm))
     g.add_node("calculation_node", calculation_node)

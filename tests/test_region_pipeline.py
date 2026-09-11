@@ -12,7 +12,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from regions import GCAM_REGIONS, normalize_region, country_to_region, region_options
+from regions import (GCAM_REGIONS, normalize_region, country_to_region,
+                     region_options, resolve_country, country_options)
 from evidence_scoring import (
     apply_region_fallback_marking, classify_source_tier, citation_region_hit,
     compute_region_assessment,
@@ -36,9 +37,13 @@ def test_normalize_region_and_country_mapping():
     assert country_to_region("Germany") == "EU-15"
     assert country_to_region("Kazakhstan") == "Central Asia"
     assert normalize_region("月球") is None                       # 自由文本兜底
+    assert normalize_region("Austria").region_id == "EU-15"
+    assert resolve_country("美国").country_id == "United States"
+    assert resolve_country("EU-15") is None
     # 前端下拉数据
     opts = region_options()
     assert any(o["region_id"] == "China" for o in opts)
+    assert any(o["country_id"] == "United States" for o in country_options())
 
 
 def test_classify_source_tier():
@@ -60,6 +65,25 @@ def test_citation_region_hit():
     # evidence_country 经成员国表归区：Germany → EU-15
     assert citation_region_hit({"title": "European market", "evidence_country": "Germany"}, eu)
     assert citation_region_hit({"title": "无关标题"}, eu, evidence_country="France")
+    us_country = resolve_country("美国")
+    assert citation_region_hit({"title": "US transformer market",
+                                "evidence_country": "USA"}, us_country)
+    assert not citation_region_hit({"title": "Industry report"}, us_country)
+    assert not citation_region_hit({"title": "Austria transformer market"}, us_country)
+
+
+def test_citation_schema_preserves_country_and_caliber():
+    from schemas import Citation, ProductResearchOutput, ResearchGeography
+    c = Citation(source_type="industry_report", title="x", confidence="high",
+                 evidence_country="USA", evidence_year=2025,
+                 evidence_scope="country", statistic_caliber="美国销量中的份额")
+    assert c.model_dump()["evidence_country"] == "USA"
+    geo = ResearchGeography(country_id="United States", country_name="美国", gcam_region_id="USA")
+    out = ProductResearchOutput(product_id="x", product_name="x", geography=geo,
+                                region_id="USA", region_name="美国",
+                                classification_dimensions=[], functional_subsystems=[],
+                                copper_components=[])
+    assert out.geography.country_id == "United States"
 
 
 def _cite(title, country=None, url="https://example.org/a", date="2025-01"):
@@ -141,16 +165,13 @@ def test_region_evidence_gate_node():
     }
     cmd = rg.region_evidence_gate(state)
     upd = cmd.update
-    assert cmd.goto == "human_review_gate"
+    assert cmd.goto == "country_agent"
     assert upd["evidence_gate_done"] is True
     assert upd["evidence_assessment"]["n_citations"] == 5
-    # 区域命中充分（IEA权威+中国命中）→ 无区域命中的 v2 被标注与否取决于分档
+    # 实体存在国家证据缺口时先派国家研究角色补查，补查前不破坏原参数。
     v2 = next(v for v in upd["dimension_proposal"][0]["values"] if v["value_id"] == "v2")
     assessment = upd["evidence_assessment"]
-    if assessment["evidence_policy"] in ("mixed", "global_proxy"):
-        assert v2["region_basis"] == "global_fallback"
-    else:  # sufficient 不逐条强制
-        assert v2.get("region_basis", "region_specific") == "region_specific"
+    assert v2.get("region_basis", "region_specific") == "region_specific"
 
 
 def test_gate_region_basis_unsupported_flag():
@@ -164,6 +185,7 @@ def test_gate_region_basis_unsupported_flag():
         "region_id": "中国", "region_name": "中国",
         "total_round": 5, "objections": [], "debate_log": [],
         "evidence_gate_done": False, "critic_coverage_score": 100,
+        "country_retry_count": 2,
         "validation_flags": [],
         # 大量区域命中 + 权威 + 多样来源 → sufficient
         "dimension_proposal": [{
@@ -194,6 +216,7 @@ def test_gate_region_basis_unsupported_flag():
     flag = next(f for f in upd["validation_flags"]
                 if f["flag_type"] == "region_basis_unsupported")
     assert "vX" in flag["description"]
+    assert flag["severity"] == "blocking"
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import re
 from datetime import datetime
 from urllib.parse import urlparse
 
-from regions import RegionInfo
+from regions import CountryInfo, RegionInfo, resolve_country
 from schemas import RegionEvidenceAssessment
 
 # ============================================================
@@ -67,7 +67,14 @@ def _domain_of(url: str) -> str:
         return ""
 
 
-def citation_region_hit(citation: dict, region: RegionInfo | None,
+def _contains_term(hay: str, term: str) -> bool:
+    """按完整词组命中，避免 Austria 因包含 us 被识别为美国。"""
+    if any(ord(ch) > 127 for ch in term):
+        return term.casefold() in hay
+    return bool(re.search(r"(?<![\w])" + re.escape(term.casefold()) + r"(?![\w])", hay))
+
+
+def citation_region_hit(citation: dict, region: RegionInfo | CountryInfo | None,
                         evidence_country: str | None = None) -> bool:
     """单条引用是否命中目标区域：
     1. evidence_country 经成员国表归区命中本区域；
@@ -75,16 +82,24 @@ def citation_region_hit(citation: dict, region: RegionInfo | None,
     region 为 None（自由文本区域）时用原始文本做子串匹配。"""
     if region is None:
         return False
-    from regions import country_to_region
     ec = evidence_country or citation.get("evidence_country")
-    if ec and country_to_region(ec) == region.region_id:
-        return True
+    if ec:
+        evidence_country_info = resolve_country(ec)
+        if isinstance(region, CountryInfo):
+            return bool(evidence_country_info and
+                        evidence_country_info.country_id == region.country_id)
+        from regions import country_to_region
+        if country_to_region(ec) == region.region_id:
+            return True
+    if isinstance(region, CountryInfo):
+        # 国家模型只接受来源显式声明的覆盖国家，标题关键词不能替代统计范围。
+        return False
     hay = " ".join(str(citation.get(k) or "") for k in
                    ("title", "publisher", "url", "excerpt_note")).casefold()
     if not hay.strip():
         return False
     for term in region.all_hit_terms:
-        if term and term.casefold() in hay:
+        if term and _contains_term(hay, term):
             return True
     return False
 
@@ -114,7 +129,7 @@ def _year_of(date_str: str | None) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def compute_region_assessment(citations: list[dict], region: RegionInfo | None,
+def compute_region_assessment(citations: list[dict], region: RegionInfo | CountryInfo | None,
                               baseline_year: int | None = None,
                               coverage_score: float | None = None) -> RegionEvidenceAssessment:
     """对一次运行的引用集合做确定性评分。
@@ -126,7 +141,9 @@ def compute_region_assessment(citations: list[dict], region: RegionInfo | None,
     n = len(citations)
     if n == 0:
         return RegionEvidenceAssessment(
-            region_id=region.region_id if region else "unknown",
+            region_id=(region.gcam_region_id if isinstance(region, CountryInfo) else
+                       region.region_id if region else "unknown"),
+            country_id=region.country_id if isinstance(region, CountryInfo) else None,
             score=0.0, tier="insufficient", component_scores={k: 0.0 for k in SCORE_WEIGHTS},
             evidence_policy="global_proxy", n_region_hits=0, n_citations=0,
             summary_note="无任何引用证据，强制采用全球主流型号替代口径",
@@ -176,7 +193,9 @@ def compute_region_assessment(citations: list[dict], region: RegionInfo | None,
             + ("" if tier == "sufficient" else
                "（区域证据不足的实体将标注 global_fallback 并采用全球主流型号替代）"))
     return RegionEvidenceAssessment(
-        region_id=region.region_id if region else "unknown",
+        region_id=(region.gcam_region_id if isinstance(region, CountryInfo) else
+                   region.region_id if region else "unknown"),
+        country_id=region.country_id if isinstance(region, CountryInfo) else None,
         score=score, tier=tier, component_scores=component,
         evidence_policy=policy, n_region_hits=hits, n_citations=n,
         summary_note=note,
@@ -184,7 +203,7 @@ def compute_region_assessment(citations: list[dict], region: RegionInfo | None,
 
 
 def entity_has_region_hit(entity: dict, citation_key: str,
-                          region: RegionInfo | None) -> bool:
+                          region: RegionInfo | CountryInfo | None) -> bool:
     """判断单个事实实体（维度取值/含铜部件）的引用是否存在区域命中"""
     if region is None:
         return False
@@ -195,7 +214,7 @@ def entity_has_region_hit(entity: dict, citation_key: str,
 
 
 def apply_region_fallback_marking(dimensions: list[dict], components: list[dict],
-                                  region: RegionInfo | None,
+                                  region: RegionInfo | CountryInfo | None,
                                   evidence_policy: str) -> tuple[list[dict], list[dict]]:
     """按证据口径给事实实体写 region_basis（确定性标注，不重跑 agent）。
 
@@ -232,7 +251,7 @@ def apply_region_fallback_marking(dimensions: list[dict], components: list[dict]
 
 
 def find_region_unsupported(dimensions: list[dict], components: list[dict],
-                            region: RegionInfo | None) -> list[str]:
+                            region: RegionInfo | CountryInfo | None) -> list[str]:
     """找出“声称 region_specific 却无任何区域命中引用”的实体（确定性审计）。
 
     供 region_evidence_gate 在 region_specific（sufficient）口径下生成

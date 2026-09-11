@@ -35,6 +35,20 @@ class RegionInfo:
             [*self.query_aliases, self.region_name_cn, *self.member_countries]))
 
 
+@dataclass(frozen=True)
+class CountryInfo:
+    """国家级研究对象；country_id 使用 GCAM 成员表中的规范英文国名。"""
+    country_id: str
+    country_name: str
+    gcam_region_id: str
+    query_aliases: tuple[str, ...] = ()
+    query_lang: str = "both"
+
+    @property
+    def all_hit_terms(self) -> list[str]:
+        return list(dict.fromkeys((self.country_id, self.country_name, *self.query_aliases)))
+
+
 # 手写元数据：region_id -> (中文名, 额外检索别名, 查询语言)
 # 检索别名为空时默认使用 [中文名, region_id]；主要成员国名由 all_hit_terms 覆盖。
 _REGION_META: dict[str, tuple[str, list[str], str]] = {
@@ -101,6 +115,32 @@ def _load_members() -> tuple[dict[str, list[str]], dict[str, str]]:
 
 _MEMBERS, _COUNTRY_MAP = _load_members()
 
+# 常用中文输入别名。规范国家全集仍来自 GCAM Sheet2，避免另建一套国家清单。
+_COUNTRY_ALIASES: dict[str, tuple[str, ...]] = {
+    "China": ("中国", "中华人民共和国", "PRC"),
+    "United States": ("美国", "美利坚合众国", "USA", "United States of America", "US", "U.S."),
+    "Germany": ("德国",), "France": ("法国",), "United Kingdom": ("英国", "UK"),
+    "Japan": ("日本",), "South Korea": ("韩国", "Republic of Korea"),
+    "India": ("印度",), "Brazil": ("巴西",), "Canada": ("加拿大",),
+    "Australia": ("澳大利亚", "澳洲"), "Russia": ("俄罗斯", "Russian Federation"),
+    "South Africa": ("南非",), "Mexico": ("墨西哥",),
+    "Indonesia": ("印度尼西亚", "印尼"), "Taiwan": ("中国台湾", "台湾"),
+}
+
+COUNTRIES: list[CountryInfo] = []
+_COUNTRY_BY_KEY: dict[str, CountryInfo] = {}
+for _country_key, _region_id in sorted(_COUNTRY_MAP.items()):
+    # _COUNTRY_MAP 的 key 已 casefold；从成员表取回规范拼写。
+    _canonical = next((c for c in _MEMBERS.get(_region_id, [])
+                       if c.casefold() == _country_key), _country_key)
+    _aliases = _COUNTRY_ALIASES.get(_canonical, ())
+    _lang = "zh" if _canonical in {"China", "Taiwan"} else "en"
+    _info = CountryInfo(_canonical, _aliases[0] if _aliases else _canonical,
+                        _region_id, _aliases, _lang)
+    COUNTRIES.append(_info)
+    for _key in (_canonical, *_aliases):
+        _COUNTRY_BY_KEY.setdefault(_key.strip().casefold(), _info)
+
 
 GCAM_REGIONS: list[RegionInfo] = []
 for _rid in sorted(set(_REGION_META) | set(_MEMBERS)):
@@ -130,14 +170,16 @@ def normalize_region(text: str | None) -> RegionInfo | None:
     hit = _REGION_BY_KEY.get(key)
     if hit:
         return hit
-    # 子串匹配（如"中国（江苏）"→China）
-    for r in GCAM_REGIONS:
-        if r.region_name_cn and r.region_name_cn in text:
-            return r
-        for a in r.query_aliases:
-            if a and a.casefold() in key:
-                return r
-    return None
+    country = resolve_country(text)
+    return next((r for r in GCAM_REGIONS if country and
+                 r.region_id == country.gcam_region_id), None)
+
+
+def resolve_country(text: str | None) -> CountryInfo | None:
+    """精确解析国家名称或别名；禁止子串猜测，未识别时返回 None。"""
+    if not text or not text.strip():
+        return None
+    return _COUNTRY_BY_KEY.get(text.strip().casefold())
 
 
 def country_to_region(country: str | None) -> str | None:
@@ -151,3 +193,9 @@ def region_options() -> list[dict]:
     """前端下拉/ datalist 用：按中文名排序"""
     return [{"region_id": r.region_id, "name_cn": r.region_name_cn,
              "members": r.member_countries} for r in GCAM_REGIONS]
+
+
+def country_options() -> list[dict]:
+    """国家级研究输入选项。"""
+    return [{"country_id": c.country_id, "country_name": c.country_name,
+             "gcam_region_id": c.gcam_region_id} for c in COUNTRIES]

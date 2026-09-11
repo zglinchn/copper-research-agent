@@ -39,6 +39,13 @@ class Citation(BaseModel):
     publisher: Optional[str] = None
     url: Optional[str] = None
     publish_date: Optional[str] = None  # ISO格式或"未知"
+    evidence_country: Optional[str] = Field(
+        default=None, description="该来源中的事实实际覆盖的国家；全球资料填None")
+    evidence_year: Optional[int] = Field(
+        default=None, description="该事实对应的统计/观测年份，不等同于发布日期")
+    evidence_scope: Literal["country", "multi_country", "regional", "global", "unspecified"] = "unspecified"
+    statistic_caliber: Optional[str] = Field(
+        default=None, description="统计对象与分母口径，如美国配电变压器销量中的铜绕组占比")
     confidence: Literal["high", "medium", "low"]
     excerpt_note: Optional[str] = Field(
         default=None,
@@ -73,6 +80,94 @@ class DimensionCategory(str, Enum):
 # "区域证据不足时的全球主流型号替代"——这是国家区分度在数据层的落点，
 # 也是导出/计算时识别兜底数据的唯一依据。
 RegionBasis = Literal["region_specific", "global_fallback"]
+
+
+class ResearchGeography(BaseModel):
+    """国家级研究范围；GCAM 区域仅用于汇总映射，不能替代国家身份。"""
+    geography_level: Literal["country"] = "country"
+    country_id: str = Field(min_length=1, description="GCAM成员表中的规范英文国名")
+    country_name: str = Field(min_length=1, description="展示用国家名")
+    gcam_region_id: str = Field(min_length=1, description="所属GCAM区域")
+
+    @model_validator(mode="after")
+    def _registered_country_consistency(self):
+        from regions import resolve_country
+        country = resolve_country(self.country_id)
+        if country is None:
+            raise ValueError(f"country_id不在国家注册表中: {self.country_id}")
+        if self.country_id != country.country_id:
+            raise ValueError(f"country_id必须使用规范值: {country.country_id}")
+        if self.gcam_region_id != country.gcam_region_id:
+            raise ValueError("country_id与gcam_region_id不一致")
+        return self
+
+
+class CountryEvidenceItem(BaseModel):
+    target_type: Literal["dimension_value", "copper_component", "market", "standard", "policy"]
+    target_id: str = Field(description="对应value_id/component_id；宏观事实使用自定义稳定ID")
+    national_finding: str
+    evidence_year: Optional[int] = None
+    citations: list[Citation] = Field(min_length=1)
+
+
+class CountryResearchProfile(BaseModel):
+    """国家研究角色输出：只记录会改变型号、基线或措施适用性的国家事实。"""
+    country_id: str
+    market_structure_summary: str
+    applicable_standards: list[str] = Field(default_factory=list)
+    material_practice_summary: str
+    policy_and_procurement_summary: Optional[str] = None
+    evidence_items: list[CountryEvidenceItem] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _strict_national_evidence(self):
+        from regions import resolve_country
+        target = resolve_country(self.country_id)
+        if target is None:
+            raise ValueError(f"country_id不在国家注册表中: {self.country_id}")
+        if self.country_id != target.country_id:
+            raise ValueError(f"country_id必须使用规范值: {target.country_id}")
+        for item in self.evidence_items:
+            for cite in item.citations:
+                actual = resolve_country(cite.evidence_country)
+                if (cite.evidence_scope != "country" or actual is None or
+                        actual.country_id != target.country_id or
+                        cite.evidence_year is None or not cite.statistic_caliber or not cite.url):
+                    raise ValueError(
+                        f"国家证据{item.target_id}必须明确覆盖目标国家，并填写URL、"
+                        "evidence_year和statistic_caliber")
+        return self
+
+
+class CountryMeasureAssessment(BaseModel):
+    measure_id: str
+    applicable_in_country: bool
+    adoption_status: Literal["not_present", "pilot", "niche", "mainstream", "restricted", "unknown"]
+    national_constraints: str
+    evidence_year: int
+    citations: list[Citation] = Field(min_length=1)
+
+
+class CountryMeasureReview(BaseModel):
+    country_id: str
+    assessments: list[CountryMeasureAssessment] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _strict_country_sources(self):
+        from regions import resolve_country
+        target = resolve_country(self.country_id)
+        if target is None:
+            raise ValueError("country_id不在国家注册表中")
+        if self.country_id != target.country_id:
+            raise ValueError(f"country_id必须使用规范值: {target.country_id}")
+        for assessment in self.assessments:
+            for cite in assessment.citations:
+                actual = resolve_country(cite.evidence_country)
+                if (actual is None or actual.country_id != target.country_id or
+                        cite.evidence_scope != "country" or cite.evidence_year is None or
+                        not cite.statistic_caliber or not cite.url):
+                    raise ValueError(f"措施{assessment.measure_id}缺少严格国家级适用性证据")
+        return self
 
 
 # ============================================================
@@ -429,6 +524,7 @@ class RegionEvidenceAssessment(BaseModel):
     部分→mixed（字段级混合标注）；不足→global_proxy（全球主流型号兜底）。
     """
     region_id: str
+    country_id: Optional[str] = None
     score: float = Field(description="综合评分0-100")
     tier: Literal["sufficient", "partial", "insufficient"]
     component_scores: dict[str, float] = Field(
@@ -569,7 +665,7 @@ class ValidationFlag(BaseModel):
 AgentRole = Literal[
     "supervisor", "dimension_agent", "structure_agent",
     "copper_agent", "reduction_agent", "critic_agent", "quant_agent",
-    "baseline_agent",
+    "baseline_agent", "country_agent", "country_policy_agent",
 ]
 
 
@@ -710,6 +806,10 @@ class ProductResearchOutput(BaseModel):
     product_name: str
     region_id: str = "unknown"
     region_name: str = "unknown"
+    geography: Optional[ResearchGeography] = Field(
+        default=None, description="新运行必填；Optional仅用于读取历史成果")
+    country_profile: Optional[CountryResearchProfile] = Field(
+        default=None, description="国家研究角色形成的市场、标准和材料选型约束")
     research_version: int = 1
     research_status: Literal[
         "draft", "pending_human_review", "approved", "amendment_in_progress",
@@ -734,6 +834,11 @@ class ProductResearchOutput(BaseModel):
 
     @model_validator(mode="after")
     def _cross_reference_integrity(self):
+        if self.geography:
+            if self.region_id != self.geography.gcam_region_id:
+                raise ValueError("region_id必须等于geography.gcam_region_id")
+            if self.country_profile and self.country_profile.country_id != self.geography.country_id:
+                raise ValueError("country_profile.country_id与geography.country_id不一致")
         subsystem_ids = {s.subsystem_id for s in self.functional_subsystems}
         dimension_ids = {d.dimension_id for d in self.classification_dimensions}
 
@@ -799,6 +904,12 @@ class ProductReductionModel(BaseModel):
     product_id: str
     region_id: str = "unknown"
     region_name: str = "unknown"
+    geography: Optional[ResearchGeography] = Field(
+        default=None, description="继承自父调研成果；Optional仅用于读取历史成果")
+    country_profile: Optional[CountryResearchProfile] = Field(
+        default=None, description="继承自父调研成果的国家市场与标准画像")
+    country_measure_review: Optional[CountryMeasureReview] = Field(
+        default=None, description="各减量措施在目标国家的现状、限制和证据")
     based_on_research_version: int = Field(
         description="本次减量化分析所依据的ProductResearchOutput版本号，用于追溯"
     )
@@ -827,6 +938,11 @@ class ProductReductionModel(BaseModel):
 
     @model_validator(mode="after")
     def _trajectory_scenario_integrity(self):
+        if self.geography and self.region_id != self.geography.gcam_region_id:
+            raise ValueError("region_id必须等于geography.gcam_region_id")
+        if (self.geography and self.country_profile and
+                self.country_profile.country_id != self.geography.country_id):
+            raise ValueError("country_profile.country_id与geography.country_id不一致")
         scenario_ids = {s.scenario_id for s in self.scenarios}
         for point in self.trajectory:
             if point.scenario_id not in scenario_ids:

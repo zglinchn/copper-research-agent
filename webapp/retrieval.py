@@ -34,7 +34,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from regions import RegionInfo
+from regions import CountryInfo, RegionInfo
 from evidence_scoring import classify_source_tier, citation_region_hit
 
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
@@ -42,6 +42,10 @@ TAVILY_ENDPOINT = "https://api.tavily.com/search"
 # 角色标记(取自各persona的「」称号) -> 基础查询模板（不含产品名/区域，运行时拼接）
 # 双语模板：(中文, 英文)，按区域的 query_lang 选择，避免非中文区域检索被中文源占据
 ROLE_QUERY_TEMPLATES: dict[str, list[tuple[str, str]]] = {
+    "国家市场与标准研究员": [
+        ("国家市场结构 标准 政策 材料选型", "national market standards policy material practice"),
+        ("政府采购 行业规范 主流配置", "government procurement industry code mainstream configuration"),
+    ],
     "分类维度分析师": [
         ("主流型号 分类维度 技术路线", "main product models classification technology routes"),
         ("型号分类 规格 标准 类型", "product models specifications standards types"),
@@ -58,6 +62,10 @@ ROLE_QUERY_TEMPLATES: dict[str, list[tuple[str, str]]] = {
         ("铜减量化 材料替代 措施", "copper reduction material substitution"),
         ("减少铜用量 工程案例", "copper saving engineering case"),
     ],
+    "国家措施适用性研究员": [
+        ("减铜措施 工程应用 政策限制", "copper reduction measure deployment policy restriction"),
+        ("材料替代 采购标准 示范项目", "material substitution procurement standard demonstration project"),
+    ],
     "定量分析师": [
         ("单位铜强度 情景", "copper intensity per unit forecast"),
         ("铜强度 预测 2035", "copper intensity projection 2035"),
@@ -66,6 +74,9 @@ ROLE_QUERY_TEMPLATES: dict[str, list[tuple[str, str]]] = {
 
 # 区域专项查询（每角色1条；拼接在基础查询之后，占用剩余证据额度）
 REGION_ROLE_QUERY_TEMPLATES: dict[str, list[tuple[str, str]]] = {
+    "国家市场与标准研究员": [
+        ("市场份额 国家标准 铜铝材料", "market share national standard copper aluminum material"),
+    ],
     "分类维度分析师": [
         ("市场占有率 主流型号", "market share leading models"),
     ],
@@ -77,6 +88,9 @@ REGION_ROLE_QUERY_TEMPLATES: dict[str, list[tuple[str, str]]] = {
     ],
     "铜减量化技术顾问": [
         ("铝代铜 政策 电网 变压器", "aluminum substitution policy transformer grid"),
+    ],
+    "国家措施适用性研究员": [
+        ("本国实施案例 技术规范", "national implementation case technical code"),
     ],
     "定量分析师": [
         ("市场规模 铜 用量", "market size copper consumption"),
@@ -280,7 +294,7 @@ class RetrievalAugmentedLLM:
         self.context_text = context_text
         self.api_key = api_key or os.environ.get("TAVILY_API_KEY")
         # 区域：RegionInfo 或 None（自由文本区域）；区域检索词/命中词由此驱动
-        self.region = region if isinstance(region, RegionInfo) else None
+        self.region = region if isinstance(region, (RegionInfo, CountryInfo)) else None
         # 可观测性：记录本LLM实例的全部检索行为，供上层写入执行日志
         self.search_log: list[dict] = []
 

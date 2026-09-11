@@ -26,6 +26,8 @@ from schemas import (
     CopperReductionMeasure, EngineeringCase, Scenario,
     IntensityTrajectoryPoint, BaselineParams, NormalizationFactor,
     HighCopperReference, ScenarioParams,
+    CountryResearchProfile, CountryEvidenceItem, CountryMeasureReview,
+    CountryMeasureAssessment,
 )
 from reduction_graph import ReductionAgentOutput
 
@@ -82,6 +84,39 @@ class _DemoStructured:
             return self._demo_trajectory(text)
         if self.schema is BaselineParams:
             return self._demo_baseline_params(text)
+        if self.schema is CountryResearchProfile:
+            match = (re.search(r"country_id=([^，；）]+)", text) or
+                     re.search(r"country_id 必须原样填写为 ([^，；。\n）]+)", text))
+            country_id = match.group(1).strip() if match else "China"
+            cite = _DEMO_CITE.model_copy(update={
+                "url": "https://example.com/demo", "evidence_country": country_id,
+                "evidence_year": 2025, "evidence_scope": "country",
+                "statistic_caliber": "演示占位国家市场口径",
+            })
+            return CountryResearchProfile(
+                country_id=country_id, market_structure_summary="演示占位国家市场结构",
+                material_practice_summary="演示占位材料惯例",
+                evidence_items=[CountryEvidenceItem(
+                    target_type="market", target_id="demo-market",
+                    national_finding="演示占位，不作为正式国家证据",
+                    evidence_year=2025, citations=[cite],
+                )],
+            )
+        if self.schema is CountryMeasureReview:
+            match = re.search(r"country_id 必须填写 ([^，；。\n）]+)", text)
+            country_id = match.group(1).strip() if match else "China"
+            measure_ids = list(dict.fromkeys(re.findall(r"'measure_id': '([^']+)'", text)))
+            cite = _DEMO_CITE.model_copy(update={
+                "url": "https://example.com/demo", "evidence_country": country_id,
+                "evidence_year": 2025, "evidence_scope": "country",
+                "statistic_caliber": "演示占位国家措施适用性口径",
+            })
+            return CountryMeasureReview(country_id=country_id, assessments=[
+                CountryMeasureAssessment(
+                    measure_id=mid, applicable_in_country=True, adoption_status="pilot",
+                    national_constraints="演示占位", evidence_year=2025, citations=[cite])
+                for mid in measure_ids
+            ])
         if self.schema is CriticReview:
             return CriticReview()  # 演示模式：critic始终一轮通过
         if self.schema is SupervisorDecision:

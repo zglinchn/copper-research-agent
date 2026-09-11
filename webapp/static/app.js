@@ -5,18 +5,21 @@ const state = {
   meta: null,            // {products, llm_mode, pipelines}
   mode: "single",        // single | batch
   selected: [],          // 选中的product_id列表
+  customProductName: "", // 用户自定义产品名称
   currentRunId: null,
+  activeRunId: null,     // 后台仍处于活动状态的运行（用于启用停止按钮）
+  activeRunStatus: null, // 上述运行的状态（用于区分「运行中」与「停止中」）
   resultTab: "dims",
   streamExpand: null,    // 当前内联展开流式输出的节点；null=全部收起
   streamManual: false,   // 用户是否手动展开/收起过（未操作时自动跟随运行中节点）
   currentRunDetail: null,
   es: null,              // SSE EventSource（token增量推送）
   liveText: {},          // SSE累积的各节点流文本（与后端stream_buf同源）
-  typePending: "",       // 打字机待播放字符队列（当前展开节点）
-  typingTimer: null,
+  streamOrder: [],       // 模型实际开始输出的节点顺序
   pollTimer: null,
   historyTimer: null,
   historyFilter: "all",  // all | success | failure
+  stopRequested: false,
 };
 
 const STATUS_TEXT = {
@@ -25,22 +28,53 @@ const STATUS_TEXT = {
   interrupted: "已中断",
 };
 
+/* 仍在推进、可被停止的状态 */
+const ACTIVE_STATUSES = ["running", "waiting_review", "queued", "cancelling"];
+const CUSTOM_PRODUCT_ID = "__custom__";
+
+/* 执行节点图标：统一线性风格（stroke=currentColor），与概览卡/产品图标同一套语言 */
+const svgIcon = (paths) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
+const GLOBE = '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.2 2.5 3.3 5.4 3.3 8.5S14.2 17.5 12 20.5c-2.2-3-3.3-5.9-3.3-8.5S9.8 5.9 12 3.5z"/>';
+/* 停止按钮图标（与 index.html 中的初始标记保持一致） */
+const ICON_STOP = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="2.5" width="11" height="11" rx="3"/><rect x="6.2" y="6.2" width="3.6" height="3.6" rx="0.8" fill="currentColor" stroke="none"/></svg>';
+const ICON_SPINNER = '<span class="spinner"></span>';
 const STEP_ICONS = {
-  start: "👤", supervisor: "🧭", dimension_agent: "📐", structure_agent: "🧱",
-  copper_agent: "🟠", critic_agent: "🛡", human_review_gate: "🕓",
-  done: "🏁", loader: "📥", reduction_agent: "🔧", quant_agent: "📊",
-  integration: "🗂",
+  start: svgIcon('<circle cx="12" cy="12" r="8.5"/><path d="M10.4 9.2l4.6 2.8-4.6 2.8z"/>'),
+  supervisor: svgIcon('<circle cx="12" cy="12" r="8.5"/><path d="M16 8l-2.1 5.9L8 16l2.1-5.9z"/>'),
+  country_agent: svgIcon(GLOBE),
+  country_policy_agent: svgIcon(GLOBE),
+  dimension_agent: svgIcon('<path d="M4.5 19.5V4.5M4.5 19.5h15M9 16l3-4.5 2.5 2L19.5 8"/>'),
+  structure_agent: svgIcon('<rect x="4" y="4" width="16" height="16" rx="2.5"/><path d="M4 12h16M12 4v16"/>'),
+  copper_agent: svgIcon('<circle cx="12" cy="12" r="6.8"/><circle cx="12" cy="12" r="2.2"/>'),
+  critic_agent: svgIcon('<path d="M12 3.5l7 2.8v4.9c0 4.2-2.9 7.6-7 8.8-4.1-1.2-7-4.6-7-8.8V6.3z"/><path d="M9.3 12l1.9 1.9 3.5-3.6"/>'),
+  human_review_gate: svgIcon('<circle cx="12" cy="12" r="8.5"/><path d="M12 7.6V12l2.8 1.7"/>'),
+  done: svgIcon('<path d="M6.5 3.5v17M6.5 5.2h11.4l-2 3.4 2 3.4H6.5"/>'),
+  loader: svgIcon('<path d="M12 3.8v9.4M8.4 10l3.6 3.6L15.6 10M5 18.6h14"/>'),
+  reduction_agent: svgIcon('<path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.8-3.8a6 6 0 01-7.9 7.9l-6.9 6.9a2.1 2.1 0 01-3-3l6.9-6.9a6 6 0 017.9-7.9z"/>'),
+  quant_agent: svgIcon('<path d="M5.5 20v-4.8M12 20V9.6M18.5 20V4.5"/>'),
+  integration: svgIcon('<path d="M3.5 7.6a2 2 0 012-2h3.1l2 2.5h7.9a2 2 0 012 2v7a2 2 0 01-2 2H5.5a2 2 0 01-2-2z"/>'),
+  fallback: svgIcon('<circle cx="12" cy="12" r="3.2"/>'),
 };
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+/* ISO时间 → "YYYY-MM-DD HH:MM" */
+const fmtTime = (iso) => {
+  if (!iso) return "";
+  const s = String(iso);
+  return s.length >= 16 ? s.slice(0, 16).replace("T", " ") : s;
+};
+
+/* 空态/占位使用的线性图标（与概览卡、产品图标同一套线条风格） */
+const ICON_DOC = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7.5A1.5 1.5 0 0 0 6 4.5v15A1.5 1.5 0 0 0 7.5 21h9a1.5 1.5 0 0 0 1.5-1.5V7z"/><path d="M14 3v4h4"/><path d="M9.5 12.5h5M9.5 16h3.5"/></svg>`;
+const ICON_SEARCH = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-3.6-3.6"/><path d="M8.5 11h5"/></svg>`;
 
 /* ================= 初始化 ================= */
 
 async function init() {
   state.meta = await fetch("/api/meta").then(r => r.json());
-  renderModeBadge();
+  await probeProductIcons(state.meta.products);
   renderProducts();
   loadRegionOptions();
   bindEvents();
@@ -48,14 +82,26 @@ async function init() {
   state.historyTimer = setInterval(refreshHistory, 3000);
 }
 
-/* GCAM 区域下拉（datalist）：/api/regions 注册表填充，保留自由文本兜底 */
+/* 产品图标预处理：/static/icons/{id}.png 是「白底线条+alpha」素材，
+   存在时用 CSS mask 着色（未选中墨蓝、选中主题蓝）；缺失时回退 emoji，
+   避免出现纯色方块。 */
+async function probeProductIcons(products) {
+  await Promise.all((products || []).map(p => new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => { p.has_line_icon = true; resolve(); };
+    img.onerror = () => { p.has_line_icon = false; resolve(); };
+    img.src = `/static/icons/${p.product_id}.png`;
+  })));
+}
+
+/* 国家下拉：规范国家由后端注册表提供。 */
 async function loadRegionOptions() {
   try {
     const data = await fetch("/api/regions").then(r => r.json());
     const dl = $("region-list");
     if (!dl) return;
-    dl.innerHTML = (data.regions || [])
-      .map(r => `<option value="${esc(r.name_cn)}">${esc(r.region_id)} / ${esc((r.members || []).slice(0, 4).join("、"))}</option>`)
+    dl.innerHTML = (data.countries || [])
+      .map(c => `<option value="${esc(c.country_name)}">${esc(c.country_id)} / ${esc(c.gcam_region_id)}</option>`)
       .join("");
   } catch (e) { /* 区域列表不可用时不阻断页面 */ }
 }
@@ -67,6 +113,22 @@ function renderRegionBaseline(result) {
                              insufficient: "badge-fallback" }[tier] || "badge-warn");
   const tierCn = { sufficient: "证据充足", partial: "部分充足", insufficient: "证据不足" };
   const part = [];
+  const g = result.geography;
+  if (g) part.push(`<div class="region-card"><h4>国家研究范围</h4>
+    <div class="axis"><b>国家：</b>${esc(g.country_name)} (${esc(g.country_id)}) ·
+    <b>GCAM区域：</b>${esc(g.gcam_region_id)}</div></div>`);
+  const profile = result.country_profile;
+  if (profile) part.push(`<div class="region-card"><h4>国家市场与标准画像</h4>
+    <div class="axis">${esc(profile.market_structure_summary)}<br>${esc(profile.material_practice_summary)}
+    ${(profile.evidence_items || []).map(i => `<div><b>${esc(i.target_id)}：</b>${esc(i.national_finding)} ` +
+      (i.citations || []).map(c => c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noreferrer">来源</a>` : "").join(" ") +
+      `</div>`).join("")}</div></div>`);
+  const measureReview = result.country_measure_review;
+  if (measureReview) part.push(`<div class="region-card"><h4>国家措施适用性</h4><div class="axis">` +
+    (measureReview.assessments || []).map(a => `<div><b>${esc(a.measure_id)}：</b>` +
+      `${a.applicable_in_country ? "适用" : "不适用"} · ${esc(a.adoption_status)} · ${esc(a.national_constraints)} ` +
+      (a.citations || []).map(c => c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noreferrer">来源</a>` : "").join(" ") +
+      `</div>`).join("") + `</div></div>`);
   if (a) {
     part.push(`<div class="region-card">
       <h4>区域证据评估 <span class="cat-badge ${badge(a.tier)}">${tierCn[a.tier] || a.tier} · ${a.score}分</span></h4>
@@ -92,19 +154,6 @@ function renderRegionBaseline(result) {
   return part.join("") || "<div class=\"empty\">无区域/基线信息</div>";
 }
 
-function renderModeBadge() {
-  const b = $("mode-badge");
-  if (state.meta.llm_mode.startsWith("online")) {
-    b.textContent = state.meta.llm_mode === "online+retrieval"
-      ? "● 在线LLM + Tavily联网检索" : "● 在线LLM调研";
-    b.className = "mode-badge online";
-  } else {
-    b.textContent = "● 演示模式（占位数据）";
-    b.className = "mode-badge demo";
-    b.title = "未配置 OPENAI_API_KEY，运行将使用演示占位数据跑通全流程";
-  }
-}
-
 function renderProducts() {
   const grid = $("product-grid");
   grid.innerHTML = "";
@@ -112,7 +161,18 @@ function renderProducts() {
     const btn = document.createElement("button");
     btn.className = "product-item";
     btn.dataset.pid = p.product_id;
-    btn.innerHTML = `<span class="pi-icon">${p.icon}</span><span>${esc(p.product_name)}</span>`;
+    btn.title = p.product_name;
+    // 名称拆成「主名 + 括号副名」两行，避免长名称把卡片撑高或折成三行
+    const m = String(p.product_name).match(/^(.+?)[（(]\s*([^）)]*?)\s*[）)]$/);
+    const main = m ? m[1] : p.product_name;
+    const sub = m ? m[2] : "";
+    const icon = p.has_line_icon
+      ? `<span class="pi-icon" style="--pi:url('/static/icons/${esc(p.product_id)}.png')"></span>`
+      : `<span class="pi-emoji">${p.icon}</span>`;
+    btn.innerHTML = icon
+      + `<span class="pi-copy"><span class="pi-name">${esc(main)}</span>`
+      + (sub ? `<span class="pi-sub">${esc(sub)}</span>` : "")
+      + `</span><span class="pi-radio"></span>`;
     btn.onclick = () => {
       if (state.mode === "single") {
         state.selected = [p.product_id];
@@ -125,6 +185,33 @@ function renderProducts() {
     };
     grid.appendChild(btn);
   });
+  // 固定放在第 8 个位置：与现有产品卡片保持同样的矩形样式，支持直接输入额外产品。
+  const custom = document.createElement("div");
+  custom.className = "product-item custom-product-item";
+  custom.dataset.pid = CUSTOM_PRODUCT_ID;
+  custom.title = "输入额外产品名称";
+  custom.innerHTML = `<span class="custom-add-icon">＋</span>
+    <span class="custom-input-wrap"><input id="custom-product-name" maxlength="80" placeholder="输入额外产品" aria-label="额外产品名称"></span>
+    <span class="pi-radio"></span>`;
+  const selectCustom = () => {
+    if (state.mode === "single") {
+      state.selected = [CUSTOM_PRODUCT_ID];
+    } else if (!state.selected.includes(CUSTOM_PRODUCT_ID)) {
+      state.selected.push(CUSTOM_PRODUCT_ID);
+    }
+    syncProductSelection();
+    updateHeader();
+  };
+  custom.onclick = selectCustom;
+  const customInput = custom.querySelector("input");
+  customInput.value = state.customProductName;
+  customInput.onclick = (event) => event.stopPropagation();
+  customInput.onfocus = selectCustom;
+  customInput.oninput = () => {
+    state.customProductName = customInput.value.trim();
+    selectCustom();
+  };
+  grid.appendChild(custom);
   state.selected = [state.meta.products[0].product_id];
   syncProductSelection();
   updateHeader();
@@ -136,12 +223,26 @@ function syncProductSelection() {
   });
 }
 
+/* 工作区标题跟随当前选择的产品（面包屑与大标题同步） */
+function setWorkspaceTitle(text) {
+  const h2 = $("workspace-title");
+  const crumb = $("workspace-breadcrumb-title");
+  if (h2 && h2.textContent !== text) h2.textContent = text;
+  if (crumb && crumb.textContent !== text) crumb.textContent = text;
+}
+
 function updateHeader() {
-  const p = state.meta.products.find(x => x.product_id === state.selected[0])
+  if (!state.meta) return;
+  const selectedId = state.selected[0];
+  const customName = state.customProductName.trim();
+  const p = state.meta.products.find(x => x.product_id === selectedId)
     || state.meta.products[0];
-  $("product-icon").textContent = p.icon;
-  $("run-title").textContent = state.mode === "batch"
-    ? "批量运行 · 7类产品调研" : `${p.product_name}多维型号与含铜部位调研`;
+  const productName = selectedId === CUSTOM_PRODUCT_ID
+    ? (customName || "额外产品") : p.product_name;
+  const batchTitle = state.selected.includes(CUSTOM_PRODUCT_ID)
+    ? "批量运行 · 标准产品与额外产品调研" : "批量运行 · 7类产品调研";
+  setWorkspaceTitle(state.mode === "batch"
+    ? batchTitle : `${productName}多维型号与含铜部位调研`);
 }
 
 function bindEvents() {
@@ -161,6 +262,9 @@ function bindEvents() {
   $("btn-stop").onclick = stopRun;
   $("btn-clear").onclick = () => {
     $("constraints").value = "";
+    state.customProductName = "";
+    const customInput = $("custom-product-name");
+    if (customInput) customInput.value = "";
     state.selected = state.mode === "batch" ? [] : [state.meta.products[0].product_id];
     syncProductSelection(); updateHeader();
   };
@@ -171,17 +275,37 @@ function bindEvents() {
     state.historyFilter = e.target.value;
     refreshHistory();
   };
+  $("btn-clear-history").onclick = clearHistory;
+  $("btn-delete-selected").onclick = deleteSelectedRun;
+
+  // 补充约束字数统计
+  const ta = $("constraints");
+  ta.addEventListener("input", () => {
+    $("char-counter").textContent = `${ta.value.length}/500`;
+  });
 }
 
 /* ================= 运行控制 ================= */
 
 async function startRun() {
-  let ids = [...state.selected];
+  const customName = state.customProductName.trim();
+  const customSelected = state.selected.includes(CUSTOM_PRODUCT_ID);
+  if (customSelected && !customName) {
+    alert("请填写额外产品名称");
+    $("custom-product-name")?.focus();
+    return;
+  }
+  let ids = state.selected.filter(id => id !== CUSTOM_PRODUCT_ID);
   if (state.mode === "batch" && ids.length === 0) {
     ids = state.meta.products.map(p => p.product_id);
   }
+  if (!ids.length && !customName) {
+    alert("请至少选择一个产品或填写额外产品");
+    return;
+  }
   const body = {
     product_ids: ids,
+    custom_product_name: customName,
     region: $("region").value.trim() || "中国",
     baseline_year: parseInt($("baseline-year").value, 10) || 2025,
     constraints: $("constraints").value.trim(),
@@ -195,16 +319,113 @@ async function startRun() {
   if (state.mode === "batch") switchToRun(data.run_ids[0]);
   else switchToRun(data.run_ids[0]);
   setRunningUI(true);
+  setStopButton(true, false);
 }
 
 function setRunningUI(running) {
   $("btn-run").disabled = running;
-  $("btn-stop").hidden = !running;
+  if (!running) state.stopRequested = false;
+}
+
+/* 停止按钮常驻显示：无进行中的任务时置灰，避免「按钮时有时无、找不到」
+   cancelling=true 时显示红色 spinner 并禁止重复点击 */
+function setStopButton(enabled, cancelling) {
+  const stop = $("btn-stop");
+  stop.disabled = cancelling;
+  stop.classList.toggle("cancelling", !!cancelling);
+  stop.title = cancelling ? "正在停止后台服务" : "停止本地后台服务";
+  // 用 innerHTML，textContent 会把按钮里的内联图标冲掉
+  stop.innerHTML = cancelling ? `${ICON_SPINNER}停止服务中…` : `${ICON_STOP}停止后台服务`;
+}
+
+/* 停止/开始按钮的可用性统一在此同步，由 renderRun 调用，
+   覆盖轮询 / 审核 / 停止 / 点历史等任何渲染路径。
+   - 开始运行：只跟「当前展示的运行是否活动」绑定；
+   - 停止运行：当前展示的运行在跑，或后台仍有活动中的运行（刷新页面后也能停止）；
+   - 后端状态已进入 cancelling 时，以状态为准显示「停止中…」。 */
+function syncRunControls(run) {
+  const shownActive = ACTIVE_STATUSES.includes(run.status) && state.currentRunId === run.run_id;
+  if (!shownActive || run.status === "cancelling") state.stopRequested = false;
+  const targetStatus = shownActive ? run.status : state.activeRunStatus;
+  const stopping = targetStatus === "cancelling" || (shownActive && state.stopRequested);
+  setRunningUI(shownActive);
+  setStopButton(shownActive || !!state.activeRunId, stopping);
 }
 
 async function stopRun() {
+  if (!confirm("停止后将关闭本地后台服务，当前运行也会中断。确定停止吗？")) return;
+  state.stopRequested = true;
+  setStopButton(true, true);
+  try {
+    const res = await fetch("/api/shutdown", { method: "POST" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail || "停止后台服务失败");
+    }
+    showServiceStopped();
+  } catch (err) {
+    // 服务可能在响应返回前已退出，此时也视为停止成功。
+    showServiceStopped();
+  }
+}
+
+function showServiceStopped() {
+  document.body.innerHTML = `<main class="service-stopped">
+    <div class="service-stopped-icon">■</div>
+    <h1>后台服务已停止</h1>
+    <p>本地服务已关闭。重新启动服务后刷新此页面即可继续使用。</p>
+  </main>`;
+}
+
+async function clearHistory() {
+  if (!confirm("将删除所有已结束运行的历史记录及其导出快照；进行中的任务会保留。确定清空吗？")) return;
+  const button = $("btn-clear-history");
+  button.disabled = true;
+  button.textContent = "清空中…";
+  try {
+    const res = await fetch("/api/runs/history", { method: "DELETE" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "清空历史失败");
+    if (data.removed_ids?.includes(state.currentRunId)) resetRunView();
+    await refreshHistory();
+  } catch (err) {
+    alert(`清空失败：${err.message}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = "清空历史";
+  }
+}
+
+async function deleteSelectedRun() {
   if (!state.currentRunId) return;
-  await fetch(`/api/runs/${state.currentRunId}/cancel`, { method: "POST" });
+  if (!confirm("将删除当前选中案例及其关联调研/减量化记录和导出快照。确定删除吗？")) return;
+  const button = $("btn-delete-selected");
+  button.disabled = true;
+  button.textContent = "删除中…";
+  try {
+    const res = await fetch(`/api/run-groups/${state.currentRunId}`, { method: "DELETE" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "删除案例失败");
+    if (data.removed_ids?.includes(state.currentRunId)) resetRunView();
+    await refreshHistory();
+  } catch (err) {
+    alert(`删除失败：${err.message}`);
+  } finally {
+    button.textContent = "删除选中";
+    await refreshHistory();
+  }
+}
+
+function resetRunView() {
+  state.currentRunId = null;
+  state.currentRunDetail = null;
+  closeStream();
+  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+  $("placeholder").hidden = false;
+  ["review-card", "run-overview-card", "workflow-card", "workflow-detail-card", "events-card", "result-card"]
+    .forEach(id => { $(id).hidden = true; });
+  setRunningUI(false);
+  setStopButton(!!state.activeRunId, state.activeRunStatus === "cancelling");
 }
 
 async function submitReview(approved) {
@@ -239,6 +460,7 @@ async function switchToRun(runId) {
   state.currentRunDetail = null;
   closeStream();
   state.liveText = {};
+  state.streamOrder = [];
   $("placeholder").hidden = true;
   renderWorkflowSkeleton();
   if (state.pollTimer) clearInterval(state.pollTimer);
@@ -247,25 +469,29 @@ async function switchToRun(runId) {
   state.pollTimer = setInterval(pollRun, 1200);
 }
 
-/* ================= SSE 逐字打字机 =================
-   服务端 /api/runs/{id}/events 推送token增量；前端把增量放入
-   打字机队列按固定节奏逐字渲染，接近ChatGPT观感。
-   断线时EventSource自动重连（重连后的init会重置liveText）。 */
+/* ================= SSE 实时token流 =================
+   服务端 /api/runs/{id}/events 直接推送模型返回的增量文本。
+   断线时EventSource自动重连（重连后的init会恢复已有缓冲）。 */
 function startStream(runId) {
   closeStream();
   state.liveText = {};
-  state.typePending = "";
+  state.streamOrder = [];
   const es = new EventSource(`/api/runs/${runId}/events`);
   state.es = es;
   es.onmessage = (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
     if (msg.type === "init") {
       state.liveText = msg.buf || {};
+      state.streamOrder = msg.order || [];
       if (state.currentRunDetail) renderRun(state.currentRunDetail);
     } else if (msg.type === "token") {
-      // SSE 已经是实时增量；直接更新当前节点，不能再进入第二个打字机队列，
-      // 否则同一段 token 会被重复追加。
+      // SSE 已经是实时增量，按服务端顺序直接追加，避免二次加工或重复追加。
       state.liveText[msg.node] = (state.liveText[msg.node] || "") + msg.text;
+      if (!state.streamOrder.includes(msg.node)) state.streamOrder.push(msg.node);
+      if (state.currentRunDetail) {
+        state.currentRunDetail.stream_current = msg.node;
+        renderExecutionLog(state.currentRunDetail);
+      }
       if (msg.node === state.streamExpand) renderStreamText(msg.node);
     } else if (msg.type === "end") {
       closeStream();
@@ -275,23 +501,6 @@ function startStream(runId) {
 
 function closeStream() {
   if (state.es) { state.es.close(); state.es = null; }
-  if (state.typingTimer) { clearInterval(state.typingTimer); state.typingTimer = null; }
-  state.typePending = "";
-}
-
-function ensureTypingTimer() {
-  if (state.typingTimer) return;
-  state.typingTimer = setInterval(() => {
-    if (!state.es || !state.typePending) return;
-    const node = state.streamExpand;
-    if (!node) return;  // 未展开时不播放（liveText仍在累积，不丢数据）
-    // 自适应吐字速度：积压越多吐越快，避免追赶不上LLM生成速度
-    const take = Math.max(2, Math.ceil(state.typePending.length / 60));
-    const chunk = state.typePending.slice(0, take);
-    state.typePending = state.typePending.slice(take);
-    state.liveText[node] = (state.liveText[node] || "") + chunk;
-    renderStreamText(node);
-  }, 24);
 }
 
 /* ================= 轮询与渲染 ================= */
@@ -303,8 +512,8 @@ async function pollRun() {
   const run = await res.json();
   state.currentRunDetail = run;
   renderRun(run);
-  const active = ["running", "waiting_review", "queued", "cancelling"].includes(run.status);
-  setRunningUI(active && state.currentRunId === run.run_id);
+  const active = ACTIVE_STATUSES.includes(run.status);
+  syncRunControls(run);
   if (!active) {
     closeStream();  // 终态：停SSE（服务端也会发end，双保险）
     if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
@@ -314,102 +523,60 @@ async function pollRun() {
 function renderWorkflowSkeleton() {
   const steps = $("workflow-steps");
   steps.innerHTML = "";
+  $("workflow-detail-steps").innerHTML = "";
+  $("workflow-card").hidden = false;
+  $("workflow-detail-card").hidden = false;
+  $("run-overview-card").hidden = true;
   $("events-card").hidden = false;
   $("events-list").innerHTML = "";
   $("review-card").hidden = true;
-  $("result-card").hidden = true;
-  $("run-status-line").hidden = false;
-  $("run-status-line").textContent = "正在加载运行状态…";
+  // 结果卡随任务一起出现，先展示空态占位
+  $("result-card").hidden = false;
+  $("result-tabs").hidden = true;
+  $("result-tabs").innerHTML = "";
+  $("result-body").innerHTML = `<div class="result-empty">
+    <div class="re-icon">${ICON_DOC}</div>
+    <b>调研结果数据将在运行完成后显示</b>
+    <p>工作流正在初始化，请稍候…</p>
+  </div>`;
+  $("btn-export-xlsx").hidden = true;
+  $("btn-export-json").hidden = true;
+  $("run-status-line").hidden = true;
 }
 
 function renderRun(run) {
   const scrollState = captureScrollState();
-  $("workflow-title").textContent = `✳ 工作流 · ${run.product_name}`;
-  const pipeline = state.meta.pipelines[run.graph_type];
-  const counts = run.node_counts || {};
-
-  // 结构说明：主管是中枢循环，不是线性步骤（避免"主管还在Running而其它已打勾"的困惑）
+  $("workflow-title").textContent = `工作流 · ${run.product_name}`;
+  // 标题以「当前展示的运行」为准，避免从历史里点开别的产品时标题对不上
+  if (run.product_name) setWorkspaceTitle(`${run.product_name}多维型号与含铜部位调研`);
+  syncRunControls(run);
+  const stageState = unifiedStageState(run);
   const stepsEl = $("workflow-steps");
-  // 签名缓存：步骤区状态无变化时不重建DOM，
-  // 避免每轮轮询摧毁打字机正在播放的流文本节点
-  const stepSig = JSON.stringify([run.graph_type, counts, run.status,
-    run.current_node, run.total_round, state.streamExpand]);
-  if (stepsEl.dataset.sig === stepSig) {
-    renderStream(run);
-  } else {
+  const stepSig = JSON.stringify([run.graph_type, run.status, run.current_node, run.total_round]);
+  if (stepsEl.dataset.sig !== stepSig) {
     stepsEl.dataset.sig = stepSig;
-    stepsEl.innerHTML = "";
-    const note = document.createElement("div");
-    note.className = "workflow-note";
-    note.textContent = "结构说明：主管调度是中枢循环——每个专业节点执行完毕后都回到主管进行下一轮分派，"
-      + "因此主管会循环多次（↻ 已循环N轮），专业节点完成后打勾，二者并不矛盾。";
-    stepsEl.appendChild(note);
-    pipeline.forEach(({ node, label }) => {
-    const count = counts[node] || 0;
-    const running = run.current_node === node && run.status === "running";
-    const isHub = node === "supervisor";  // 中枢节点：循环执行，不用线性✓语义
-    let cls = "step", statusHtml;
-    if (node === "start") {
-      cls += " done"; statusHtml = `<span>✓</span>`;
-    } else if (node === "done") {
-      if (run.status === "completed") { cls += " done"; statusHtml = `<span>✓</span>`; }
-      else if (run.status === "failed") { cls += " error"; statusHtml = `<span>失败</span>`; }
-      else if (run.status === "cancelled") { cls += " error"; statusHtml = `<span>已停止</span>`; }
-      else { cls += " pending"; statusHtml = `<span>—</span>`; }
-    } else if (running) {
-      cls += " running";
-      statusHtml = isHub
-        ? `<span>第${count + 1}轮分派中</span><span class="spinner"></span>`
-        : `<span>Running</span><span class="spinner"></span>`;
-    } else if (count > 0) {
-      cls += " done";
-      if (isHub) cls += " hub-done";
-      statusHtml = isHub
-        ? `<span>↻ 已循环${count}轮</span>`
-        : `<span>✓${count > 1 ? ` ×${count}` : ""}</span>`;
-    } else {
-      cls += " pending"; statusHtml = `<span>—</span>`;
-    }
-    if (node === "human_review_gate" && run.status === "waiting_review") {
-      cls += " running";
-      statusHtml = `<span>等待审核</span><span class="spinner"></span>`;
-    }
-    const row = document.createElement("div");
-    row.className = cls;
-    row.innerHTML = `
-      <div class="step-icon">${STEP_ICONS[node] || "•"}</div>
-      <div><span class="step-name">${esc(label)}</span>${count > 1 ? `<span class="step-count">已执行${count}次</span>` : ""}</div>
-      <div class="step-status">${statusHtml}</div>`;
-    // 点击节点行：展开/收起该节点下方的LLM实时流式输出
-    row.onclick = () => toggleStream(node);
-    if (state.streamExpand === node) row.classList.add("selected");
-    stepsEl.appendChild(row);
-    // 内联流容器（紧跟在节点行下方，展开时显示）
-    const holder = document.createElement("div");
-    holder.className = "step-stream";
-    holder.dataset.streamNode = node;
-    if (state.streamExpand !== node) holder.hidden = true;
-    stepsEl.appendChild(holder);
-    });
+    stepsEl.innerHTML = stageState.map((stage, index) => `
+      <div class="step ${stage.state}" title="${esc(stage.detail)}">
+        <div class="step-icon">${stage.state === "done" ? "✓" : index + 1}</div>
+        <span class="step-name">${stage.label}</span>
+      </div>
+      ${index < stageState.length - 1 ? `<div class="step-connector ${stage.state === "done" ? "done" : ""}"></div>` : ""}`).join("");
+  }
+  renderUnifiedOverview(run, stageState);
+  renderDetailedWorkflow(run);
+
+  // 仅在出错时展示状态行
+  const statusLine = $("run-status-line");
+  if (run.error) {
+    statusLine.hidden = false;
+    statusLine.textContent = `错误：${run.error}`;
+  } else {
+    statusLine.hidden = true;
   }
 
-  renderStream(run);
-
-  const statusLine = $("run-status-line");
-  statusLine.hidden = false;
-  statusLine.textContent =
-    `状态：${STATUS_TEXT[run.status] || run.status} ｜ 轮次：${run.total_round ?? 0} ｜ `
-    + (run.error ? `错误：${run.error}` : (run.current_node ? `当前节点：${run.current_node}` : "排队中"));
-
-  // 事件日志
+  // 执行日志改为真实模型输出：不再用节点摘要替代token流。
   $("events-card").hidden = false;
-  const evEl = $("events-list");
-  evEl.innerHTML = (run.events || []).slice().reverse().map(e => `
-    <div class="event-row">
-      <span class="event-time">${esc(e.time)}</span>
-      <span class="event-node">${esc(e.label)}</span>
-      <span class="event-detail">${esc(e.detail)}</span>
-    </div>`).join("") || `<div class="empty">暂无事件</div>`;
+  renderExecutionLog(run);
 
   // 人工审核
   if (run.status === "waiting_review" && run.review) {
@@ -426,11 +593,263 @@ function renderRun(run) {
     $("review-card").hidden = true;
   }
 
-  // 结果面板
+  // 结果面板：有产出渲染结果，否则展示正在生成中的结构化结果预览
   if (run.result) {
     renderResult(run);
+  } else {
+    renderResultEmpty(run);
   }
   restoreScrollState(scrollState);
+}
+
+function renderExecutionLog(run) {
+  const el = $("events-list");
+  if (!el) return;
+  const buffers = { ...(run.stream_buf || {}) };
+  Object.entries(state.liveText || {}).forEach(([node, text]) => {
+    buffers[node] = text;
+  });
+  const pipeline = state.meta?.pipelines?.[run.graph_type] || [];
+  const preferredOrder = [
+    ...(state.streamOrder || []), ...(run.stream_order || []),
+    ...pipeline.map(x => x.node),
+  ];
+  const order = [...new Set(preferredOrder)].filter(node => buffers[node]);
+  if (!order.length) {
+    const demo = run.llm_mode === "demo"
+      ? "当前为演示模式，未配置真实大模型，因此没有真实 token 流；结构化结果仍会在下方实时汇总。"
+      : "正在等待大模型返回第一个 token…";
+    el.innerHTML = `<div class="stream-log-empty">${esc(demo)}</div>`;
+    return;
+  }
+  const active = ACTIVE_STATUSES.includes(run.status);
+  const counts = run.node_counts || {};
+  const messages = order.map(node => {
+    const live = active && run.stream_current === node;
+    const text = buffers[node] || "";
+    const rawId = `raw-stream-${node}`;
+    return `<section class="conversation-message ${live ? "live" : "done"}">
+      <div class="conversation-avatar">AI</div>
+      <div class="conversation-body">
+        <div class="conversation-head">
+          <b>${esc(streamAgentLabel(node))}</b>
+          <span>${live ? "● 正在进行" : "✓ 已完成"}</span>
+        </div>
+        <div class="conversation-text">${esc(live ? liveActivity(node) : completedActivity(node, run, counts[node] || 0))}${live ? '<span class="typing-caret">▌</span>' : ""}</div>
+        <div class="conversation-meta">已接收 ${text.length.toLocaleString()} 个可见输出字符</div>
+        <details class="stream-raw-inline" id="${rawId}">
+          <summary>查看原始模型输出</summary>
+          <pre>${esc(text)}</pre>
+        </details>
+      </div>
+    </section>`;
+  }).join("");
+  el.innerHTML = messages;
+  if (active) el.scrollTop = el.scrollHeight;
+}
+
+function liveActivity(node) {
+  const activities = {
+    start: "我正在初始化这次调研任务，确认研究国家、基准年和补充约束。",
+    supervisor: "我正在根据当前结果调度下一位分析 Agent，并判断是否需要补充证据。",
+    country_agent: "我正在检索目标国家的市场、标准、政策和材料惯例，并整理可核验来源。",
+    dimension_agent: "我正在归纳主流型号的分类维度，检查每个取值是否落在对应分类轴上。",
+    structure_agent: "我正在拆解产品功能子系统，建立从系统到叶子部件的结构树。",
+    copper_agent: "我正在逐个结构节点识别含铜部位，补充铜形态、用铜原因和证据。",
+    critic_agent: "我正在审查维度、结构、含铜部位和证据之间的一致性，标记需要修订的问题。",
+    region_evidence_gate: "我正在评估区域证据覆盖度，确认国家事实和引用口径是否满足发布条件。",
+    human_review_gate: "调研初稿已经形成，我正在等待人工审核后继续下一阶段。",
+    loader: "我正在加载已经审核通过的调研成果，准备减量化分析。",
+    baseline_agent: "我正在统一功能单位和基线参数，为后续确定性计算准备输入。",
+    baseline_calc_node: "我正在用固定程序计算减量前单位铜强度基线。",
+    reduction_agent: "我正在检索可落地的减量化措施、工程案例和适用边界。",
+    country_policy_agent: "我正在核查减量化措施在目标国家的采用状态、政策限制和工程条件。",
+    quant_agent: "我正在定义不同情景的启动年、目标年、实现率和扩散方式。",
+    calculation_node: "我正在用确定性程序计算各情景下的铜强度路径。",
+    integration: "我正在整合调研证据、减量措施和计算结果，准备生成最终成果。",
+  };
+  return activities[node] || "我正在处理这一阶段的结构化研究结果。";
+}
+
+function completedActivity(node, run, count) {
+  const event = [...(run.events || [])].reverse().find(e => e.node === node);
+  if (event?.detail) return event.detail;
+  const partial = run.partial_result || {};
+  const sizes = {
+    country_agent: partial.country_profile?.evidence_items?.length,
+    dimension_agent: partial.classification_dimensions?.length,
+    structure_agent: partial.functional_subsystems?.length,
+    copper_agent: partial.copper_components?.length,
+    reduction_agent: partial.reduction_measures?.length,
+    quant_agent: partial.scenario_params?.length,
+  };
+  const size = sizes[node];
+  return size ? `这一阶段已完成，形成 ${size} 项结构化结果。` : `这一阶段已完成${count > 1 ? `（第 ${count} 次）` : ""}。`;
+}
+
+function renderDetailedWorkflow(run) {
+  const card = $("workflow-detail-card");
+  const stepsEl = $("workflow-detail-steps");
+  const live = $("detail-live");
+  const pipeline = state.meta.pipelines[run.graph_type] || [];
+  const counts = run.node_counts || {};
+  card.hidden = false;
+  live.hidden = !(run.status === "running" && run.stream_current);
+
+  const sig = JSON.stringify([run.graph_type, counts, run.status, run.current_node, state.streamExpand]);
+  if (stepsEl.dataset.sig !== sig) {
+    stepsEl.dataset.sig = sig;
+    stepsEl.innerHTML = "";
+    pipeline.forEach(({ node, label }) => {
+      const count = counts[node] || 0;
+      const running = run.current_node === node && run.status === "running";
+      const isHub = node === "supervisor";
+      let stateClass = "pending";
+      let status = "待执行";
+      if (node === "start") {
+        stateClass = "done"; status = "已开始";
+      } else if (node === "done") {
+        if (run.status === "completed") { stateClass = "done"; status = "已完成"; }
+        else if (["failed", "cancelled", "interrupted"].includes(run.status)) { stateClass = "error"; status = STATUS_TEXT[run.status]; }
+      } else if (node === "human_review_gate" && run.status === "waiting_review") {
+        stateClass = "running"; status = "等待审核";
+      } else if (running) {
+        stateClass = "running"; status = isHub ? `第${count + 1}轮分派中` : "正在运行";
+      } else if (count > 0) {
+        stateClass = "done"; status = isHub ? `已调度${count}轮` : (count > 1 ? `已执行${count}次` : "已完成");
+      }
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = `detail-step ${stateClass}${state.streamExpand === node ? " selected" : ""}`;
+      row.innerHTML = `
+        <span class="detail-icon">${STEP_ICONS[node] || STEP_ICONS.fallback}</span>
+        <span class="detail-name">${esc(label)}</span>
+        <span class="detail-count">${count > 1 ? `执行 ${count} 次` : ""}</span>
+        <span class="detail-status">${stateClass === "done" ? "✓ " : ""}${esc(status)}${stateClass === "running" ? '<span class="spinner"></span>' : ""}</span>`;
+      row.onclick = () => toggleStream(node);
+      stepsEl.appendChild(row);
+
+      const holder = document.createElement("div");
+      holder.className = "step-stream detail-stream";
+      holder.dataset.streamNode = node;
+      holder.hidden = state.streamExpand !== node;
+      stepsEl.appendChild(holder);
+    });
+  }
+  renderStream(run);
+}
+
+/* 结果空态：运行中/待审核时结果卡的占位内容 */
+function renderResultEmpty(run) {
+  $("result-card").hidden = false;
+  $("btn-export-xlsx").hidden = true;
+  $("btn-export-json").hidden = true;
+  renderResultPreview(run);
+}
+
+function renderResultPreview(run) {
+  const result = run.partial_result || {
+    product_id: run.product_id, product_name: run.product_name,
+  };
+  const isReduction = run.graph_type === "reduction" || !!result.reduction_measures;
+  const tabs = [["dims", "分类维度体系"], ["tree", "结构分解"], ["copper", "含铜部件"], ["region", "区域与基线"]];
+  if (isReduction) tabs.push(["measures", "减量措施"], ["scenarios", "情景定义"], ["traj", "强度路径"]);
+  tabs.push(["flags", "审查记录"], ["json", "JSON"]);
+  if (!tabs.some(([key]) => key === state.resultTab)) state.resultTab = tabs[0][0];
+  const tabsEl = $("result-tabs");
+  tabsEl.hidden = false;
+  tabsEl.innerHTML = tabs.map(([key, label]) =>
+    `<button class="tab ${key === state.resultTab ? "active" : ""}" data-rtab="${key}">${label}</button>`).join("");
+  document.querySelectorAll("[data-rtab]").forEach(button => {
+    button.onclick = () => { state.resultTab = button.dataset.rtab; renderResultPreview(run); };
+  });
+  const progressNote = run.status === "waiting_review"
+    ? "产品调研已完成，当前展示人工审核前的结构化结果。"
+    : run.status === "running"
+      ? "结构化结果正在随节点完成实时汇总，以下内容不是摘要。"
+      : "运行已停止，以下为本次已产出的结构化结果。";
+  const body = $("result-body");
+  const t = state.resultTab;
+  let content;
+  if (t === "dims") content = result.classification_dimensions?.length ? renderDims(result.classification_dimensions) : previewEmpty("分类维度体系", "等待调研维度规划节点输出");
+  else if (t === "tree") content = result.functional_subsystems?.length ? renderTree(result) : previewEmpty("功能子系统结构树", "等待结构分解节点输出");
+  else if (t === "copper") content = result.copper_components?.length ? renderCopper(result.copper_components) : previewEmpty("含铜部位清单", "等待含铜部位识别节点输出");
+  else if (t === "region") content = result.geography || result.country_profile || result.evidence_assessment ? renderRegionBaseline(result) : previewEmpty("区域与基线", "等待国家研究与区域证据评估节点输出");
+  else if (t === "measures") content = result.reduction_measures?.length ? renderMeasures(result.reduction_measures) : previewEmpty("减量措施", "等待减量化调研节点输出");
+  else if (t === "scenarios") content = result.scenarios?.length ? renderScenarios(result.scenarios) : previewEmpty("情景定义", "等待情景参数节点输出");
+  else if (t === "traj") content = result.trajectory?.length ? renderTrajectory(result.trajectory) : previewEmpty("强度路径", "等待确定性计算节点输出");
+  else if (t === "flags") content = renderFlags(result);
+  else content = `<pre class="json-view">${esc(JSON.stringify(result, null, 2))}</pre>`;
+  body.innerHTML = `<div class="result-live-note">● ${esc(progressNote)}</div>${content}`;
+}
+
+function previewEmpty(title, note) {
+  return `<div class="result-preview-empty"><div class="re-icon">${ICON_DOC}</div><b>${esc(title)}</b><p>${esc(note)}</p></div>`;
+}
+
+/* 阶段状态 → 状态胶囊的文字与配色 */
+function setStatusPill(el, state) {
+  if (!el) return;
+  const map = { done: ["已完成", "success"], running: ["运行中", "running"], error: ["失败", "error"] };
+  const [text, tone] = map[state] || ["待开始", "pending"];
+  el.textContent = text;
+  el.className = `status-pill ${tone}`;
+}
+
+function unifiedStageState(run) {
+  const stages = [
+    { label: "产品调研", detail: "多维型号、结构、含铜部位与证据调研" },
+    { label: "人工审核", detail: "审核产品调研成果后进入下一阶段" },
+    { label: "减量化", detail: "基线、减量措施与定量建模" },
+    { label: "成果导出", detail: "导出已完成的标准 JSON 与正式报告" },
+  ].map(x => ({ ...x, state: "pending" }));
+  if (run.graph_type === "reduction") {
+    stages[0].state = "done";
+    stages[1].state = "done";
+    stages[2].state = run.status === "completed" ? "done" : run.status === "failed" ? "error" : "running";
+    stages[3].state = run.status === "completed" ? "done" : "pending";
+  } else {
+    stages[0].state = run.status === "waiting_review" || run.status === "completed" ? "done" : run.status === "failed" ? "error" : "running";
+    stages[1].state = run.status === "waiting_review" ? "running" : run.status === "completed" ? "done" : "pending";
+  }
+  return stages;
+}
+
+function renderUnifiedOverview(run, stages) {
+  const card = $("run-overview-card");
+  if (!card) return;
+  card.hidden = false;
+  const reduction = run.graph_type === "reduction";
+  const stopping = run.status === "cancelling";
+  const completed = run.status === "completed";
+  const failed = ["failed", "cancelled", "interrupted"].includes(run.status);
+  const percent = stopping ? null : completed ? 100 : failed ? null : reduction ? 68 : stages[0].state === "done" ? 45 : 18;
+  const ring = document.querySelector(".overview-ring");
+  ring.className = `overview-ring ${completed ? "done" : (failed || stopping) ? "paused" : ""}`;
+  const titles = {
+    waiting_review: "等待人工审核",
+    cancelling: "正在停止运行",
+    failed: "运行失败",
+    cancelled: "运行已停止",
+    interrupted: "运行已中断",
+  };
+  $("overview-title").textContent = titles[run.status]
+    || (reduction ? "正在进行减量化分析" : "正在进行产品调研");
+  $("overview-note").textContent = stopping
+    ? "已发出停止信号，将在当前节点执行结束处生效"
+    : failed
+      ? (run.error ? String(run.error).slice(0, 80) : "可从左侧重新发起运行")
+      : reduction ? "基于已批准的产品调研成果" : "调研成果与减量化分析将在同一任务中连续展示";
+  $("overview-percent").textContent = percent === null ? "—" : `${percent}%`;
+  $("overview-progress-bar").style.width = `${percent === null ? 0 : percent}%`;
+  // 阶段状态 → 文字 + 配色（done/running/pending/error 四种，不再一律用运行中色）
+  setStatusPill($("research-status"), stages[0].state);
+  setStatusPill($("reduction-status"),
+    completed ? "done" : failed ? "error" : reduction ? "running" : "pending");
+  const reductionButton = $("btn-reduction");
+  if (reductionButton) {
+    reductionButton.hidden = !(run.graph_type === "research" && run.status === "completed" && !!run.result?.classification_dimensions);
+  }
 }
 
 /* 轮询会刷新多个区域，但不能打断用户当前阅读位置。 */
@@ -480,7 +899,7 @@ function renderStream(run) {
   });
 }
 
-/* 打字机tick时只更新已展开节点的文本（不重建DOM） */
+/* 实时token到达时只更新已展开节点的文本（不重建DOM） */
 function renderStreamText(node) {
   const el = document.querySelector(`.step-stream[data-stream-node="${node}"]`);
   if (!el || el.hidden) return;
@@ -489,9 +908,7 @@ function renderStreamText(node) {
   renderStreamShell(el, state.liveText[node] || "", live);
 }
 
-/* 构建/更新流面板：pre内用三个span的textContent分段渲染
-  （JSON骨架暗色、reasoning高亮、尾部暗色），打字机逐字追加时
-   只更新textContent不重建DOM，滚动位置与光标动画得以保留。 */
+/* 构建/更新流面板：保留结构化输出原文，并在token到达时更新可见文本。 */
 function renderStreamShell(el, raw, live) {
   if (!raw) {
     el.innerHTML = `<div class="stream-empty">该节点暂无LLM流式输出（尚未调用LLM，或为演示模式瞬时生成）</div>`;
@@ -584,18 +1001,19 @@ function renderResult(run) {
   const isReduction = !!result.reduction_measures;
 
   const tabs = [];
+  if (result.classification_dimensions) {
+    tabs.push(["dims", "分类维度体系"], ["tree", "结构分解"], ["copper", "含铜部件"]);
+  }
   if (result.classification_dimensions || result.evidence_assessment || result.model_baselines) {
     tabs.push(["region", "区域与基线"]);
-  }
-  if (result.classification_dimensions) {
-    tabs.push(["dims", "分类维度体系"], ["tree", "结构分解"], ["copper", "含铜部位"]);
   }
   if (isReduction) {
     tabs.push(["measures", "减量措施"], ["scenarios", "情景定义"], ["traj", "强度路径"]);
   }
-  tabs.push(["flags", "质询与校验"], ["log", "交锋日志"], ["json", "JSON"]);
+  tabs.push(["flags", "审查记录"], ["log", "交锋日志"], ["json", "JSON"]);
 
   if (!tabs.some(([k]) => k === state.resultTab)) state.resultTab = tabs[0][0];
+  $("result-tabs").hidden = false;
   $("result-tabs").innerHTML = tabs.map(([k, label]) =>
     `<button class="tab ${k === state.resultTab ? "active" : ""}" data-rtab="${k}">${label}</button>`).join("");
   document.querySelectorAll("[data-rtab]").forEach(b => {
@@ -615,12 +1033,13 @@ function renderResult(run) {
   else if (t === "log") body.innerHTML = renderLog(result.debate_log || []);
   else if (t === "json") body.innerHTML = `<pre class="json-view">${esc(JSON.stringify(result, null, 2))}</pre>`;
 
-  // 导出链接 + 图B入口（仅调研成果已完成时）
+  // 导出链接 + 减量化入口（仅调研成果已完成时）
   $("btn-export-xlsx").onclick = () => downloadFile(`/api/runs/${run.run_id}/export.xlsx`);
   $("btn-export-json").onclick = () => downloadFile(`/api/runs/${run.run_id}/result.json`);
   $("btn-export-xlsx").hidden = false;
   $("btn-export-json").hidden = false;
-  $("btn-reduction").hidden = !result.classification_dimensions;
+  $("btn-reduction").hidden = !(run.graph_type === "research" && run.status === "completed" && result.classification_dimensions);
+  $("result-card").hidden = false;
 }
 
 /* 导出下载：fetch+blob 方式。服务端出错时给出可读提示，
@@ -872,25 +1291,80 @@ async function refreshHistory() {
   const res = await fetch("/api/runs");
   if (!res.ok) return;
   const data = await res.json();
+  // 记录后台是否仍有活动中的运行：刷新页面后即使没展示它，停止按钮也应可用
+  const live = (data.runs || []).filter(r => ACTIVE_STATUSES.includes(r.status))
+    .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+  state.activeRunId = live.length ? live[0].run_id : null;
+  state.activeRunStatus = live.length ? live[0].status : null;
+  if (!state.currentRunDetail) {
+    setRunningUI(false);
+    setStopButton(!!state.activeRunId, state.activeRunStatus === "cancelling");
+  }
   const list = $("history-list");
-  const runs = state.historyFilter === "all"
-    ? data.runs
-    : data.runs.filter(r => runOutcome(r.status) === state.historyFilter);
-  if (!runs.length) {
+  const groups = groupRunHistory(data.runs || []);
+  const filtered = state.historyFilter === "all"
+    ? groups
+    : groups.filter(g => runOutcome(g.status) === state.historyFilter);
+  const selected = groups.find(g => g.current.run_id === state.currentRunId);
+  const deleteButton = $("btn-delete-selected");
+  if (deleteButton) {
+    deleteButton.disabled = !selected || !["completed", "failed", "cancelled", "interrupted"].includes(selected.status);
+  }
+  if (!filtered.length) {
     list.innerHTML = `<div class="empty">${data.runs.length ? "该筛选条件下暂无运行记录" : "暂无运行记录"}</div>`;
     return;
   }
-  list.innerHTML = runs.map(r => {
-    const st = STATUS_TEXT[r.status] || r.status;
-    const active = r.run_id === state.currentRunId;
-    const icon = { research: "🔍", reduction: "📉" }[r.graph_type] || "•";
-    return `<div class="history-item ${active ? "active" : ""}" data-rid="${r.run_id}">
-      <span>${icon}</span>
-      <span>${esc(r.product_name)} · ${r.graph_type === "research" ? "调研" : "减量化"}</span>
-      <span class="st">${esc(st)}</span></div>`;
+  list.innerHTML = filtered.map(g => {
+    const active = g.current.run_id === state.currentRunId;
+    const pid = g.research.product_id;
+    const knownProduct = state.meta?.products.find(p => p.product_id === pid);
+    const thumb = knownProduct
+      ? `<img class="hi-thumb" src="/static/products/${esc(pid)}.png" alt="">`
+      : `<span class="hi-thumb hi-thumb-custom" aria-label="额外产品">＋</span>`;
+    const outcome = runOutcome(g.status);
+    const pill = outcome === "success"
+      ? `<span class="hi-pill success">已完成</span>`
+      : outcome === "failure"
+        ? `<span class="hi-pill danger">${esc(STATUS_TEXT[g.status] || "失败")}</span>`
+        : `<span class="hi-pill running">${esc(STATUS_TEXT[g.status] || "运行中")}</span>`;
+    const time = outcome === "success"
+      ? `完成时间：${fmtTime(g.reduction?.finished_at || g.research.finished_at) || "－"}`
+      : `开始时间：${fmtTime(g.current.created_at || g.research.created_at) || "－"}`;
+    const detail = `<div class="hi-meta">${esc(time)}</div>`;
+    return `<div class="history-item ${active ? "active" : ""}" data-rid="${g.current.run_id}">
+      ${thumb}
+      <div class="hi-body">
+        <div class="hi-head">
+          <span class="hi-title">${esc(g.product_name)} · 调研与减量化</span>
+          ${pill}
+        </div>
+        ${detail}
+      </div>
+      <span class="hi-chevron">›</span>
+    </div>`;
   }).join("");
   list.querySelectorAll("[data-rid]").forEach(el => {
     el.onclick = () => switchToRun(el.dataset.rid);
+  });
+}
+
+function groupRunHistory(runs) {
+  const byId = Object.fromEntries(runs.map(r => [r.run_id, r]));
+  const groups = new Map();
+  runs.forEach(r => {
+    const rootId = r.graph_type === "reduction" && r.parent_run_id ? r.parent_run_id : r.run_id;
+    const root = byId[rootId] || r;
+    if (!groups.has(rootId)) groups.set(rootId, { research: root, reduction: null, current: root });
+    const g = groups.get(rootId);
+    if (r.graph_type === "reduction" && (!g.reduction || r.created_at > g.reduction.created_at)) {
+      g.reduction = r;
+    }
+    g.current = r.created_at >= g.current.created_at ? r : g.current;
+  });
+  return [...groups.values()].map(g => {
+    const status = g.reduction?.status && g.reduction.status !== "completed"
+      ? g.reduction.status : g.reduction?.status === "completed" ? "completed" : g.research.status;
+    return { ...g, status, product_name: g.research.product_name };
   });
 }
 
